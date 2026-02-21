@@ -5,9 +5,8 @@ import io
 import json
 import os
 import subprocess
-import traceback
-from dataclasses import dataclass, asdict
-from typing import Any, Dict, List, Optional, Tuple
+from dataclasses import asdict, dataclass
+from typing import Any, Dict, List, Optional
 
 import gradio as gr
 from PIL import Image
@@ -15,11 +14,10 @@ from PIL import Image
 from shared.utils.plugins import WAN2GPPlugin
 
 
-# -----------------------------
-# Helpers: ffprobe + image uri
-# -----------------------------
+# =========================
+# FFprobe helper (audio)
+# =========================
 def _which_ffprobe() -> str:
-    # Wan2GP typically provides ffmpeg/ffprobe in the working directory on Windows.
     if os.name == "nt":
         for cand in ("ffprobe.exe", "ffprobe"):
             if os.path.exists(cand):
@@ -29,17 +27,8 @@ def _which_ffprobe() -> str:
 
 
 def probe_audio_duration_seconds(path: str) -> Optional[float]:
-    """Return duration in seconds using ffprobe JSON output."""
     ffprobe = _which_ffprobe()
-    cmd = [
-        ffprobe,
-        "-v",
-        "error",
-        "-show_format",
-        "-of",
-        "json",
-        path,
-    ]
+    cmd = [ffprobe, "-v", "error", "-show_format", "-of", "json", path]
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, check=True)
         data = json.loads(p.stdout)
@@ -59,27 +48,25 @@ def pil_to_data_uri(img: Image.Image, fmt: str = "PNG") -> str:
     return f"data:image/{fmt.lower()};base64,{b64}"
 
 
-# -----------------------------
+# =========================
 # Project model
-# -----------------------------
+# =========================
 @dataclass
 class MediaItem:
     id: str
-    path: str
     name: str
+    path: str
     kind: str  # "video" | "image" | "audio"
     fps: Optional[float] = None
     frames: Optional[int] = None
     duration_s: Optional[float] = None
-    w: Optional[int] = None
-    h: Optional[int] = None
 
 
 @dataclass
 class Clip:
     id: str
     media_id: str
-    track_id: str  # "V1","V2","V3","A1","A2","A3"
+    track_id: str  # V1,V2,V3,A1,A2,A3
     start_f: int
     in_f: int
     out_f: int  # exclusive
@@ -97,9 +84,10 @@ class Project:
 
 
 def default_project() -> Project:
+    # With fps=25 and px_per_frame=2 => 50 px per second like your original demo math
     return Project(
         fps=25.0,
-        px_per_frame=2.0,  # keeps your existing ruler math
+        px_per_frame=2.0,
         playhead_f=0,
         selected_clip_id=None,
         media=[],
@@ -125,17 +113,6 @@ def loads_project(raw: str) -> Project:
     )
 
 
-def _track_priority(track_id: str) -> int:
-    # Higher V number = higher priority (V3 over V2 over V1)
-    # Audio not used for preview image priority
-    if track_id.startswith("V"):
-        try:
-            return int(track_id[1:])
-        except Exception:
-            return 0
-    return -1
-
-
 def find_media(p: Project, media_id: str) -> Optional[MediaItem]:
     for m in p.media:
         if m.id == media_id:
@@ -152,47 +129,60 @@ def find_clip(p: Project, clip_id: Optional[str]) -> Optional[Clip]:
     return None
 
 
+def clip_duration_frames(c: Clip) -> int:
+    return max(1, c.out_f - c.in_f)
+
+
 def clip_covers_frame(c: Clip, frame: int) -> bool:
-    dur = max(1, c.out_f - c.in_f)
+    dur = clip_duration_frames(c)
     return c.start_f <= frame < (c.start_f + dur)
 
 
-def compute_preview_frame_uri(plugin: "TimelineEditorPlugin", p: Project) -> Optional[str]:
+def track_priority(track_id: str) -> int:
+    # V3 > V2 > V1, audio ignored for preview
+    if track_id.startswith("V"):
+        try:
+            return int(track_id[1:])
+        except Exception:
+            return 0
+    return -999
+
+
+def compute_preview_uri(plugin: "TimelineEditorPlugin", p: Project) -> str:
     """
-    Real preview: choose the topmost video/image clip under playhead and extract the correct frame/image.
+    Real preview: choose topmost (highest V-track) video/image clip under playhead and render a frame/image.
     """
     frame = p.playhead_f
     candidates = [c for c in p.clips if c.kind in ("video", "image") and clip_covers_frame(c, frame)]
     if not candidates:
-        return None
+        return ""
 
-    # pick highest video track priority
-    candidates.sort(key=lambda c: _track_priority(c.track_id), reverse=True)
+    candidates.sort(key=lambda c: track_priority(c.track_id), reverse=True)
     top = candidates[0]
-    media = find_media(p, top.media_id)
-    if not media:
-        return None
+    m = find_media(p, top.media_id)
+    if not m:
+        return ""
 
     try:
         if top.kind == "image":
-            img = Image.open(media.path).convert("RGB")
+            img = Image.open(m.path).convert("RGB")
             return pil_to_data_uri(img, "PNG")
 
-        # video: map timeline frame -> media frame
+        # video
         media_frame = top.in_f + (frame - top.start_f)
         get_frame = getattr(plugin, "get_video_frame", None)
         if callable(get_frame):
-            pil_img = get_frame(media.path, int(media_frame), return_PIL=True)
+            pil_img = get_frame(m.path, int(media_frame), return_PIL=True)
             if isinstance(pil_img, Image.Image):
                 return pil_to_data_uri(pil_img, "PNG")
-        return None
+        return ""
     except Exception:
-        return None
+        return ""
 
 
-# -----------------------------
+# =========================
 # Plugin
-# -----------------------------
+# =========================
 class TimelineEditorPlugin(WAN2GPPlugin):
     name = "Wan2GP Timeline Editor"
 
@@ -204,567 +194,761 @@ class TimelineEditorPlugin(WAN2GPPlugin):
             position=1,
         )
 
-        # Wan2GP injects requested globals as attributes via setattr(plugin, name, fn). :contentReference[oaicite:3]{index=3}
+        # Wan2GP injects requested globals as attributes via setattr(plugin, name, fn)
         self.request_global("get_unique_id")
         self.request_global("has_video_file_extension")
         self.request_global("has_image_file_extension")
         self.request_global("has_audio_file_extension")
-        self.request_global("get_video_info")   # returns (fps,w,h,frame_count). :contentReference[oaicite:4]{index=4}
-        self.request_global("get_video_frame")  # can return PIL if return_PIL=True. :contentReference[oaicite:5]{index=5}
+        self.request_global("get_video_info")   # returns (fps,w,h,frame_count)
+        self.request_global("get_video_frame")  # supports return_PIL=True
 
         self.request_component("state")
 
     def create_ui(self):
-        # Keep your UI layout, but:
-        # - Hide "Explorer"
-        # - Remove preview timestamp overlay
-        # - JS/Python in English
-        css = """
-        /* Keep the provided look */
-        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap');
-        #nle-root { font-family: 'Inter', sans-serif; background:#111111; color:#d1d5db; user-select:none; }
-        /* Hide the Explorer tab without changing layout */
-        #nle-root [data-hide="explorer"] { display:none !important; }
-        """
+        # Keep UI exactly (markup), but do NOT rely on <head> scripts.
+        # We mount the body HTML into #nle-mount, then load Tailwind/Phosphor in root.load(js=...).
+        mount_container = "<div id='nle-mount'></div>"
 
-        # This is your UI HTML, kept structurally identical but:
-        # - language strings in English where trivial
-        # - Explorer tab hidden via data-hide
-        # - preview timestamp overlay removed
-        ui_html = r"""
-<div id="nle-root" class="h-screen w-screen flex flex-col overflow-hidden text-xs cursor-select">
-  <main class="flex-1 flex flex-col min-h-0">
+        # Hidden bridges
+        project_json = gr.Textbox(value=dumps_project(default_project()), visible=False, elem_id="te-project-json")
+        cmd_json = gr.Textbox(value="", visible=False, elem_id="te-cmd-json")
+        preview_uri = gr.Textbox(value="", visible=False, elem_id="te-preview-uri")
 
-    <!-- TOP HALF -->
+        # Hidden uploader used by the UI button (Import)
+        uploader = gr.File(label="Uploader", file_count="multiple", visible=False, elem_id="nle-upload")
+
+        # Your HTML "body" (NO <!DOCTYPE>, NO <html>, NO <head>, NO external <script src=...>, NO inline <script>).
+        # UI stays the same visually. We only add:
+        # - id hooks (already present)
+        # - we will hide Explorer + preview timestamp via CSS in JS stage (no markup change).
+        UI_BODY_HTML = r"""
+<main class="flex-1 flex flex-col min-h-0">
+    <!-- MOITIÉ SUPÉRIEURE -->
     <div class="flex h-[55%] min-h-0 border-b panel-border">
 
-      <!-- TOP LEFT: Effects / Source -->
-      <div class="w-[28%] flex flex-col panel-bg border-r panel-border">
-        <div class="flex items-center justify-between px-3 py-2 border-b border-[#2a2a2a] bg-[#1a1a1a]">
-          <div class="flex gap-4">
-            <span class="text-gray-400 cursor-pointer">Source: (none)</span>
-            <span class="tab-active font-medium cursor-pointer">Effect Controls</span>
-          </div>
-        </div>
-        <div class="flex-1 p-3 flex flex-col gap-2 overflow-auto" id="effect-panel">
-          <span class="text-gray-500">(Select a clip to edit parameters)</span>
-        </div>
-      </div>
-
-      <!-- TOP RIGHT: Program Monitor -->
-      <div class="flex-1 flex flex-col panel-bg">
-        <div class="flex items-center justify-between px-3 py-2 border-b border-[#2a2a2a] bg-[#1a1a1a]">
-          <span class="text-gray-400 font-medium">Program: Sequence 01</span>
+        <!-- HAUT GAUCHE : Options d'effet & Source -->
+        <div class="w-[28%] flex flex-col panel-bg border-r panel-border">
+            <div class="flex items-center justify-between px-3 py-2 border-b border-[#2a2a2a] bg-[#1a1a1a]">
+                <div class="flex gap-4">
+                    <span class="text-gray-400 cursor-pointer">Source : (sans élément)</span>
+                    <span class="tab-active font-medium cursor-pointer">Options d'effet <i class="ph ph-list ml-1 text-gray-500"></i></span>
+                </div>
+            </div>
+            <div class="flex-1 p-3 flex flex-col gap-2 overflow-auto" id="effect-panel">
+                <span class="text-gray-500">(Sélectionnez un clip pour voir les paramètres FFmpeg)</span>
+            </div>
         </div>
 
-        <div class="flex-1 bg-black flex items-center justify-center relative overflow-hidden group">
-          <!-- REAL preview image updated by Python (data URI) -->
-          <img id="program-preview"
-               alt="Program Preview"
-               class="max-w-full max-h-full object-contain pointer-events-none opacity-95"
-               style="filter: contrast(110%);"
-               src="">
-        </div>
-
-        <div class="h-12 bg-[#1e1e1e] flex flex-col px-3 justify-center shrink-0 border-t panel-border">
-          <div class="flex items-center justify-between">
-            <div class="flex items-center gap-3">
-              <span class="text-[#2d8ceb] font-mono" id="main-timecode">00:00:00:00</span>
-              <span class="text-gray-400 bg-[#2a2a2a] px-2 py-0.5 rounded text-xxs flex items-center gap-1 cursor-pointer hover:text-white">Fit</span>
+        <!-- HAUT DROITE : Moniteur du Programme -->
+        <div class="flex-1 flex flex-col panel-bg">
+            <div class="flex items-center justify-between px-3 py-2 border-b border-[#2a2a2a] bg-[#1a1a1a]">
+                <span class="text-gray-400 font-medium">Programme : Séquence FFmpeg 01 <i class="ph ph-list ml-1 text-gray-500"></i></span>
             </div>
 
-            <div class="flex items-center gap-4 text-gray-400 text-lg">
-              <span id="btn-export" title="Export (FFmpeg)" style="cursor:pointer;">⤓</span>
+            <div class="flex-1 bg-black flex items-center justify-center relative overflow-hidden group">
+                <img
+                    id="program-preview"
+                    src="https://images.unsplash.com/photo-1542382156909-9ae37b3f56fd?q=80&w=1200&auto=format&fit=crop"
+                    alt="Previsualisation Video"
+                    class="max-w-full max-h-full object-contain pointer-events-none opacity-80 mix-blend-lighten"
+                    style="filter: sepia(40%) hue-rotate(-10deg) saturate(150%) contrast(120%);">
+                <div class="absolute inset-0 bg-orange-900/20 mix-blend-overlay"></div>
+
+                <!-- Timecode Overlay (will be hidden in JS/CSS) -->
+                <div class="absolute top-4 right-4 text-white/50 font-mono text-xl tracking-widest drop-shadow-md" id="preview-timecode">
+                    00:00:00:00
+                </div>
             </div>
 
-            <div class="flex items-center gap-3 text-gray-400">
-              <span class="font-mono" id="sequence-duration">--:--:--:--</span>
+            <div class="h-12 bg-[#1e1e1e] flex flex-col px-3 justify-center shrink-0 border-t panel-border">
+                <div class="flex items-center justify-between">
+                    <div class="flex items-center gap-3">
+                        <span class="text-[#2d8ceb] font-mono" id="main-timecode">00:00:00:00</span>
+                        <span class="text-gray-400 bg-[#2a2a2a] px-2 py-0.5 rounded text-xxs flex items-center gap-1 cursor-pointer hover:text-white">
+                            Adapter <i class="ph ph-caret-down"></i>
+                        </span>
+                    </div>
+
+                    <div class="flex items-center gap-4 text-gray-400 text-lg">
+                        <i class="ph ph-brackets-angle hover:text-white cursor-pointer"></i>
+                        <i class="ph ph-skip-back hover:text-white cursor-pointer"></i>
+                        <i class="ph-fill ph-play hover:text-white cursor-pointer text-xl"></i>
+                        <i class="ph ph-skip-forward hover:text-white cursor-pointer"></i>
+                        <i class="ph ph-camera hover:text-white cursor-pointer"></i>
+                    </div>
+
+                    <div class="flex items-center gap-3 text-gray-400">
+                        <span class="text-xxs">1/2</span>
+                        <i class="ph ph-wrench hover:text-white cursor-pointer"></i>
+                        <span class="font-mono" id="sequence-duration">00:00:00:00</span>
+                    </div>
+                </div>
             </div>
-          </div>
         </div>
-      </div>
     </div>
 
-    <!-- BOTTOM HALF -->
+    <!-- MOITIÉ INFÉRIEURE -->
     <div class="flex flex-1 min-h-0">
 
-      <!-- BOTTOM LEFT: Project (NO Explorer) -->
-      <div class="w-[28%] flex flex-col panel-bg border-r panel-border">
-        <div class="flex items-center gap-4 px-3 py-2 border-b border-[#2a2a2a] bg-[#1a1a1a]">
-          <span class="tab-active font-medium cursor-pointer">Project</span>
-          <span class="text-gray-400 cursor-pointer" data-hide="explorer">Explorer</span>
-        </div>
-
-        <div class="p-2 flex justify-between items-center border-b border-[#2a2a2a]">
-          <div class="flex gap-2">
-            <span class="text-gray-400">🔎</span>
-          </div>
-          <div class="flex gap-2 text-gray-400">
-            <span class="text-xxs ml-2" id="media-count">0 item(s)</span>
-          </div>
-        </div>
-
-        <!-- Media pool -->
-        <div class="flex-1 p-2 flex gap-2 overflow-auto items-start content-start flex-wrap relative transition-colors duration-200"
-             id="media-pool">
-          <div class="absolute inset-0 flex items-center justify-center text-gray-600 pointer-events-none border-2 border-transparent z-0"
-               id="drag-overlay">
-            <div class="text-center flex flex-col items-center">
-              <span style="font-size:26px;">⇩</span>
-              <span>Use “Import media” to add files</span>
+        <!-- BAS GAUCHE : Explorateur de médias -->
+        <div class="w-[28%] flex flex-col panel-bg border-r panel-border" id="media-panel">
+            <div class="flex items-center gap-4 px-3 py-2 border-b border-[#2a2a2a] bg-[#1a1a1a]">
+                <span class="tab-active font-medium cursor-pointer">Projet <i class="ph ph-list ml-1 text-gray-500"></i></span>
+                <span class="text-gray-400 cursor-pointer" id="tab-explorer">Explorateur</span>
             </div>
-          </div>
-        </div>
 
-        <div class="h-8 border-t border-[#2a2a2a] flex items-center px-2 gap-3 text-gray-400 text-lg">
-          <button id="btn-import" class="text-sm px-2 py-1 rounded bg-[#2a2a2a] hover:bg-[#333]">Import media</button>
-          <span id="import-status" class="text-[10px] text-gray-500"></span>
-        </div>
-      </div>
-
-      <!-- TOOLS -->
-      <div class="w-10 flex flex-col items-center py-2 panel-bg border-r panel-border gap-3 text-gray-400 shrink-0" id="tools-panel">
-        <div class="tool tool-active text-white" data-tool="selection" title="Selection (V)">↖</div>
-        <div class="tool" data-tool="razor" title="Razor (C)">✂</div>
-      </div>
-
-      <!-- TIMELINE -->
-      <div class="flex-1 flex flex-col panel-bg relative overflow-hidden">
-
-        <!-- RULER -->
-        <div class="h-8 border-b border-[#2a2a2a] flex relative pl-40 bg-[#1e1e1e]" id="timeline-header">
-          <div class="absolute left-0 top-0 w-40 h-full border-r border-[#2a2a2a] flex items-center px-2 justify-between z-30 bg-[#1e1e1e]">
-            <span class="text-[#2d8ceb] font-mono text-xs" id="ruler-tc">00:00:00:00</span>
-          </div>
-
-          <div class="flex-1 relative overflow-hidden flex items-end cursor-text" id="time-ruler">
-            <div class="w-[2000px] flex justify-between px-2 text-[9px] text-gray-500 font-mono pb-0.5 select-none pointer-events-none" id="ruler-marks">
+            <div class="p-2 flex justify-between items-center border-b border-[#2a2a2a]">
+                <div class="flex gap-2">
+                    <i class="ph ph-magnifying-glass text-gray-400"></i>
+                </div>
+                <div class="flex gap-2 text-gray-400">
+                    <i class="ph ph-list cursor-pointer hover:text-white"></i>
+                    <i class="ph ph-grid-four cursor-pointer text-white"></i>
+                    <span class="text-xxs ml-2" id="media-count">0 élément(s)</span>
+                </div>
             </div>
-            <div class="absolute bottom-0 -ml-[7px] w-0 h-0 border-l-[7px] border-r-[7px] border-t-[9px] border-l-transparent border-r-transparent border-t-[#2d8ceb] z-20 cursor-ew-resize"
-                 id="playhead-head" style="left: 100px;"></div>
-          </div>
-        </div>
 
-        <!-- TRACKS -->
-        <div class="flex-1 flex overflow-auto relative bg-[#181818]" id="timeline-container">
-          <div class="absolute top-0 bottom-0 w-[1px] bg-[#2d8ceb] z-40 pointer-events-none" id="playhead-line" style="left: 260px;"></div>
-          <div class="razor-line" id="razor-guide"></div>
-
-          <!-- TRACK HEADERS -->
-          <div class="w-40 shrink-0 bg-[#252525] flex flex-col border-r border-[#2a2a2a] z-30 sticky left-0">
-            <div class="h-8 border-b border-[#111] flex items-center px-2 gap-2 text-gray-400"><div class="w-5 text-center text-[10px] font-bold">V3</div></div>
-            <div class="h-8 border-b border-[#111] flex items-center px-2 gap-2 text-gray-400"><div class="w-5 text-center text-[10px] font-bold">V2</div></div>
-            <div class="h-8 border-b border-[#2a2a2a] bg-[#2a2a2a]/20 flex items-center px-2 gap-2 text-gray-200">
-              <div class="w-5 h-5 bg-[#2d8ceb] rounded-sm flex items-center justify-center text-[10px] font-bold text-white">V1</div>
-              <div class="w-5 text-center text-[10px] font-bold">V1</div>
+            <div class="flex-1 p-2 flex gap-2 overflow-auto items-start content-start flex-wrap relative transition-colors duration-200" id="media-pool">
+                <div class="absolute inset-0 flex items-center justify-center text-gray-600 pointer-events-none border-2 border-transparent z-0" id="drag-overlay">
+                    <div class="text-center flex flex-col items-center">
+                        <i class="ph ph-download-simple text-3xl mb-2"></i>
+                        <span>Glissez-déposez des fichiers ici</span>
+                    </div>
+                </div>
             </div>
-            <div class="h-2 bg-[#1a1a1a] border-b border-[#111]"></div>
-            <div class="h-10 border-b border-[#2a2a2a] bg-[#2a2a2a]/20 flex items-center px-2 gap-2 text-gray-200">
-              <div class="w-5 h-5 bg-[#2d8ceb] rounded-sm flex items-center justify-center text-[10px] font-bold text-white">A1</div>
-              <div class="w-5 text-center text-[10px] font-bold">A1</div>
+
+            <div class="h-8 border-t border-[#2a2a2a] flex items-center px-2 gap-3 text-gray-400 text-lg">
+                <i class="ph ph-magnifying-glass hover:text-white cursor-pointer text-sm"></i>
+                <i class="ph ph-folder hover:text-white cursor-pointer text-sm"></i>
+                <i class="ph ph-file-plus hover:text-white cursor-pointer text-sm" id="btn-import"></i>
+                <i class="ph ph-trash hover:text-white cursor-pointer text-sm ml-auto"></i>
             </div>
-            <div class="h-10 border-b border-[#111] flex items-center px-2 gap-2 text-gray-400"><div class="w-5 text-center text-[10px] font-bold">A2</div></div>
-            <div class="h-10 border-b border-[#111] flex items-center px-2 gap-2 text-gray-400"><div class="w-5 text-center text-[10px] font-bold">A3</div></div>
-            <div class="flex-1 bg-[#1a1a1a]"></div>
-          </div>
-
-          <!-- TRACK CONTENT -->
-          <div class="flex flex-col min-w-[2000px] relative w-full" id="tracks-content">
-            <div class="h-8 border-b border-[#252525] relative track" data-track="V3"></div>
-            <div class="h-8 border-b border-[#252525] relative track" data-track="V2"></div>
-            <div class="h-8 border-b border-[#2a2a2a] bg-[#2a2a2a]/20 relative track" data-track="V1" id="track-V1"></div>
-
-            <div class="h-2"></div>
-
-            <div class="h-10 border-b border-[#2a2a2a] bg-[#2a2a2a]/20 relative track" data-track="A1" id="track-A1"></div>
-            <div class="h-10 border-b border-[#252525] relative track" data-track="A2"></div>
-            <div class="h-10 border-b border-[#252525] relative track" data-track="A3"></div>
-          </div>
         </div>
 
-        <div class="h-4 bg-[#1a1a1a] border-t border-[#2a2a2a] flex items-center px-40">
-          <div class="w-1/3 h-2 bg-[#444] rounded-full mx-2"></div>
+        <!-- BARRE D'OUTILS -->
+        <div class="w-10 flex flex-col items-center py-2 panel-bg border-r panel-border gap-3 text-gray-400 shrink-0" id="tools-panel">
+            <i class="ph-fill ph-cursor text-white hover:text-white cursor-pointer tool-active" data-tool="selection" title="Outil Sélection (V)"></i>
+            <i class="ph ph-arrows-right hover:text-white cursor-pointer" data-tool="track"></i>
+            <i class="ph ph-scissors hover:text-white cursor-pointer" data-tool="ripple"></i>
+            <i class="ph-fill ph-knife hover:text-white cursor-pointer" data-tool="razor" title="Outil Cutter (C)"></i>
+            <i class="ph ph-corners-out hover:text-white cursor-pointer" data-tool="slip"></i>
+            <i class="ph-fill ph-pen-nib hover:text-white cursor-pointer" data-tool="pen"></i>
+            <i class="ph-fill ph-hand-palm hover:text-white cursor-pointer" data-tool="hand"></i>
+            <i class="ph ph-text-t hover:text-white cursor-pointer" data-tool="text"></i>
         </div>
-      </div>
+
+        <!-- BAS DROITE : Timeline -->
+        <div class="flex-1 flex flex-col panel-bg relative overflow-hidden">
+
+            <!-- Timeline Header (Ruler) -->
+            <div class="h-8 border-b border-[#2a2a2a] flex relative pl-40 bg-[#1e1e1e]" id="timeline-header">
+                <div class="absolute left-0 top-0 w-40 h-full border-r border-[#2a2a2a] flex items-center px-2 justify-between z-30 bg-[#1e1e1e]">
+                    <span class="text-[#2d8ceb] font-mono text-xs" id="ruler-tc">00:00:00:00</span>
+                    <div class="flex gap-1 text-gray-400">
+                        <i class="ph ph-wrench text-xs"></i>
+                        <i class="ph ph-magnet text-xs text-blue-500"></i>
+                    </div>
+                </div>
+
+                <div class="flex-1 relative overflow-hidden flex items-end cursor-text" id="time-ruler">
+                    <div class="w-[2000px] flex justify-between px-2 text-[9px] text-gray-500 font-mono pb-0.5 select-none pointer-events-none" id="ruler-marks">
+                    </div>
+                    <div class="absolute bottom-0 -ml-[7px] w-0 h-0 border-l-[7px] border-r-[7px] border-t-[9px] border-l-transparent border-r-transparent border-t-[#2d8ceb] z-20 cursor-ew-resize" id="playhead-head" style="left: 100px;"></div>
+                </div>
+            </div>
+
+            <!-- Tracks Area -->
+            <div class="flex-1 flex overflow-auto relative bg-[#181818]" id="timeline-container">
+                <div class="absolute top-0 bottom-0 w-[1px] bg-[#2d8ceb] z-40 pointer-events-none" id="playhead-line" style="left: 260px;"></div>
+                <div class="razor-line" id="razor-guide"></div>
+
+                <!-- Track headers -->
+                <div class="w-40 shrink-0 bg-[#252525] flex flex-col border-r border-[#2a2a2a] z-30 sticky left-0">
+                    <div class="h-8 border-b border-[#111] flex items-center px-2 gap-2 text-gray-400"><div class="w-5 text-center text-[10px] font-bold">V3</div></div>
+                    <div class="h-8 border-b border-[#111] flex items-center px-2 gap-2 text-gray-400"><div class="w-5 text-center text-[10px] font-bold">V2</div></div>
+                    <div class="h-8 border-b border-[#111] flex items-center px-2 gap-2 text-gray-200 bg-[#353b48]">
+                        <div class="w-5 h-5 bg-[#2d8ceb] rounded-sm flex items-center justify-center text-[10px] font-bold text-white">V1</div>
+                        <div class="w-5 text-center text-[10px] font-bold">V1</div>
+                    </div>
+                    <div class="h-2 bg-[#1a1a1a] border-b border-[#111]"></div>
+                    <div class="h-10 border-b border-[#111] flex items-center px-2 gap-2 text-gray-200 bg-[#353b48]">
+                        <div class="w-5 h-5 bg-[#2d8ceb] rounded-sm flex items-center justify-center text-[10px] font-bold text-white">A1</div>
+                        <div class="w-5 text-center text-[10px] font-bold">A1</div>
+                    </div>
+                    <div class="h-10 border-b border-[#111] flex items-center px-2 gap-2 text-gray-400"><div class="w-5 text-center text-[10px] font-bold">A2</div></div>
+                    <div class="h-10 border-b border-[#111] flex items-center px-2 gap-2 text-gray-400"><div class="w-5 text-center text-[10px] font-bold">A3</div></div>
+                    <div class="flex-1 bg-[#1a1a1a]"></div>
+                </div>
+
+                <!-- Track content -->
+                <div class="flex flex-col min-w-[2000px] relative w-full" id="tracks-content">
+                    <div class="h-8 border-b border-[#252525] relative track" data-track="V3"></div>
+                    <div class="h-8 border-b border-[#252525] relative track" data-track="V2"></div>
+                    <div class="h-8 border-b border-[#2a2a2a] bg-[#2a2a2a]/20 relative track" data-track="V1" id="track-V1"></div>
+
+                    <div class="h-2"></div>
+
+                    <div class="h-10 border-b border-[#2a2a2a] bg-[#2a2a2a]/20 relative track" data-track="A1" id="track-A1"></div>
+                    <div class="h-10 border-b border-[#252525] relative track" data-track="A2"></div>
+                    <div class="h-10 border-b border-[#252525] relative track" data-track="A3"></div>
+                </div>
+            </div>
+
+            <div class="h-4 bg-[#1a1a1a] border-t border-[#2a2a2a] flex items-center px-40">
+                <div class="w-1/3 h-2 bg-[#444] rounded-full mx-2 cursor-pointer hover:bg-[#555]"></div>
+            </div>
+        </div>
+
+        <!-- Audio meters -->
+        <div class="w-12 panel-bg border-l panel-border flex flex-col pb-4 shrink-0">
+            <div class="flex-1 flex justify-center gap-1 pt-6 pb-2 px-1 relative">
+                <div class="absolute inset-y-0 right-1 py-6 flex flex-col justify-between text-[8px] text-gray-500 font-mono text-right z-10 pointer-events-none">
+                    <span>0</span><span>-12</span><span>-24</span><span>-36</span><span>-48</span>
+                </div>
+                <div class="w-2.5 bg-[#111] rounded-t-sm border border-[#222] relative overflow-hidden flex flex-col justify-end"><div class="w-full h-[65%] audio-meter" id="meter-l"></div></div>
+                <div class="w-2.5 bg-[#111] rounded-t-sm border border-[#222] relative overflow-hidden flex flex-col justify-end"><div class="w-full h-[60%] audio-meter" id="meter-r"></div></div>
+            </div>
+        </div>
+
     </div>
-  </main>
-</div>
+</main>
 
 <style>
+  /* Base */
+  #app-body {
+    font-family: 'Inter', sans-serif;
+    background-color: #111111;
+    color: #d1d5db;
+    user-select: none;
+  }
+
   /* Scrollbars */
   ::-webkit-scrollbar { width: 10px; height: 10px; }
   ::-webkit-scrollbar-track { background: #1e1e1e; border-left: 1px solid #000; border-top: 1px solid #000; }
   ::-webkit-scrollbar-thumb { background: #3a3a3a; border-radius: 5px; border: 2px solid #1e1e1e; }
   ::-webkit-scrollbar-thumb:hover { background: #4a4a4a; }
 
+  /* UI base */
   .panel-bg { background-color: #1e1e1e; }
   .panel-border { border-color: #000000; border-width: 1px; }
   .tab-active { color: #ffffff; position: relative; }
   .tab-active::after { content: ''; position: absolute; bottom: -6px; left: 0; width: 100%; height: 2px; background-color: #2d8ceb; }
   .text-xxs { font-size: 0.65rem; line-height: 1rem; }
 
+  /* Audio meter */
+  .audio-meter {
+    background: linear-gradient(to top, #00ff00 0%, #00ff00 75%, #ffff00 75%, #ffff00 90%, #ff0000 90%, #ff0000 100%);
+  }
+
+  /* Drag highlight */
+  .drag-over { background-color: #2a2a2a !important; border: 2px dashed #2d8ceb !important; }
+
+  /* Clips & tools */
   .clip { transition: filter 0.1s; position: absolute; height: calc(100% - 2px); top: 1px; display: flex; align-items: center; padding: 0 4px; overflow: hidden; border-radius: 2px; }
   .clip:hover { filter: brightness(1.2); }
   .clip.audio { background-color: #1f6a43; border: 1px solid #339e66; }
   .clip.video { background-color: #5d30a6; border: 1px solid #a178e6; }
-  .clip.image { background-color: #3b82f6; border: 1px solid #93c5fd; }
+  .clip.image { background-color: #1d4ed8; border: 1px solid #60a5fa; }
 
-  .tool { font-size: 16px; line-height: 16px; cursor:pointer; }
   .tool-active { color: #2d8ceb !important; }
 
+  /* Cursors */
   .cursor-razor { cursor: crosshair !important; }
   .cursor-select { cursor: default !important; }
   .razor-line { position: absolute; top: 0; bottom: 0; width: 1px; background: red; pointer-events: none; z-index: 50; display: none; }
+
+  /* Requested: hide preview timestamp overlay without changing UI markup */
+  #preview-timecode { display: none !important; }
+
+  /* Requested: remove Explorer tab without changing UI layout */
+  #tab-explorer { display: none !important; }
 </style>
 """
 
-        # JS: real project_json + cmd_json bridge (English only)
-        js = r"""
-        function() {
-          const projEl = document.querySelector('#te-project-json textarea');
-          const cmdEl  = document.querySelector('#te-cmd-json textarea');
-          const prevEl = document.querySelector('#te-preview-uri textarea');
-          const uploadRoot = document.getElementById('te-upload');
+        js = rf"""
+function() {{
+  // ---- utilities ----
+  function $(sel, root=document) {{ return root.querySelector(sel); }}
 
-          const root = document.getElementById('nle-root');
-          if (!projEl || !cmdEl || !root) return;
+  async function loadCssOnce(href, id) {{
+    if (document.getElementById(id)) return;
+    const link = document.createElement("link");
+    link.id = id;
+    link.rel = "stylesheet";
+    link.href = href;
+    document.head.appendChild(link);
+  }}
 
-          const ui = {
-            activeTool: 'selection',
-            dragging: null, // { clipId, startX, startLeft }
-          };
+  async function loadScriptOnce(src, id) {{
+    if (document.getElementById(id)) return;
+    await new Promise((resolve, reject) => {{
+      const s = document.createElement("script");
+      s.id = id;
+      s.src = src;
+      s.onload = resolve;
+      s.onerror = reject;
+      document.head.appendChild(s);
+    }});
+  }}
 
-          function safeParse(s){
-            try { return JSON.parse(s || '{}'); } catch(e){ return null; }
-          }
+  function safeParse(s) {{
+    try {{ return JSON.parse(s || "{{}}"); }} catch(e) {{ return null; }}
+  }}
 
-          function pushCmd(obj){
-            cmdEl.value = JSON.stringify(obj);
-            cmdEl.dispatchEvent(new Event('input', { bubbles: true }));
-          }
+  function sendCmd(cmdEl, obj) {{
+    cmdEl.value = JSON.stringify(obj);
+    cmdEl.dispatchEvent(new Event("input", {{ bubbles: true }}));
+  }}
 
-          function frameToTimecode(frame, fps){
-            const ff = Math.max(0, Math.round(frame));
-            const frames = ff % Math.round(fps);
-            const totalSeconds = Math.floor(ff / fps);
-            const ss = totalSeconds % 60;
-            const totalMinutes = Math.floor(totalSeconds / 60);
-            const mm = totalMinutes % 60;
-            const hh = Math.floor(totalMinutes / 60);
-            const pad2 = (n)=>String(n).padStart(2,'0');
-            return `${pad2(hh)}:${pad2(mm)}:${pad2(ss)}:${pad2(frames)}`;
-          }
+  function frameToTimecode(frame, fps) {{
+    const f = Math.max(0, Math.round(frame));
+    const fpsI = Math.max(1, Math.round(fps));
+    const ff = f % fpsI;
+    const totalSeconds = Math.floor(f / fpsI);
+    const ss = totalSeconds % 60;
+    const totalMinutes = Math.floor(totalSeconds / 60);
+    const mm = totalMinutes % 60;
+    const hh = Math.floor(totalMinutes / 60);
+    const pad2 = (n) => String(n).padStart(2, "0");
+    return `${{pad2(hh)}}:${{pad2(mm)}}:${{pad2(ss)}}:${{pad2(ff)}}`;
+  }}
 
-          function setCursor(){
-            if (ui.activeTool === 'razor'){
-              root.classList.remove('cursor-select');
-              root.classList.add('cursor-razor');
-            } else {
-              root.classList.remove('cursor-razor');
-              root.classList.add('cursor-select');
-              const razorGuide = document.getElementById('razor-guide');
-              if (razorGuide) razorGuide.style.display = 'none';
-            }
-          }
+  // ---- mount + assets + init ----
+  async function ensureAssets() {{
+    // Inter font is already used via CSS in UI, but load anyway (safe)
+    await loadCssOnce(
+      "https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&display=swap",
+      "nle-inter-font"
+    );
 
-          // -----------------------------
-          // Media pool rendering
-          // -----------------------------
-          function renderMediaPool(p){
-            const pool = document.getElementById('media-pool');
-            const overlay = document.getElementById('drag-overlay');
-            const count = document.getElementById('media-count');
-            if (!pool || !overlay || !count) return;
+    // Tailwind CDN (required for your classes like flex, w-[28%], etc.)
+    // IMPORTANT: mount first (so Tailwind can see your classnames), then load this script.
+    await loadScriptOnce("https://cdn.tailwindcss.com", "nle-tailwind-v3");
 
-            // keep overlay node
-            pool.innerHTML = '';
-            pool.appendChild(overlay);
+    // Phosphor icons (regular + fill)
+    await loadCssOnce(
+      "https://cdn.jsdelivr.net/npm/@phosphor-icons/web@2.1.2/src/regular/style.css",
+      "nle-phosphor-regular"
+    );
+    await loadCssOnce(
+      "https://cdn.jsdelivr.net/npm/@phosphor-icons/web@2.1.2/src/fill/style.css",
+      "nle-phosphor-fill"
+    );
+  }}
 
-            const media = p.media || [];
-            count.textContent = `${media.length} item(s)`;
-            overlay.style.display = media.length ? 'none' : 'flex';
+  function mountUI() {{
+    const mount = document.getElementById("nle-mount");
+    if (!mount) return false;
+    if (mount.dataset.mounted === "1") return true;
 
-            media.forEach(m => {
-              const el = document.createElement('div');
-              el.className = 'w-24 flex flex-col gap-1 cursor-pointer p-1 rounded-sm hover:bg-[#2a2a2a] group';
-              el.draggable = true;
-              el.dataset.mediaId = m.id;
+    mount.innerHTML = `{UI_BODY_HTML.replace("`", "\\`")}`;
+    mount.dataset.mounted = "1";
+    return true;
+  }}
 
-              const kind = m.kind;
-              const icon = (kind === 'audio') ? '🔊' : (kind === 'image') ? '🖼' : '🎞';
-              const dur = (m.duration_s != null) ? `${m.duration_s.toFixed(1)}s` : '';
-              el.innerHTML = `
-                <div class="relative w-full h-14 bg-black flex items-center justify-center overflow-hidden rounded-sm border border-[#333] group-hover:border-[#555]">
-                  <div style="opacity:.6;font-size:18px;">${icon}</div>
-                  <div class="absolute bottom-0 right-0 bg-black/80 px-1 text-[9px] font-mono text-gray-300">${dur}</div>
-                </div>
-                <span class="text-[9px] text-gray-300 truncate px-1" title="${m.name}">${m.name}</span>
-              `;
+  function appInit() {{
+    const projEl = $("#te-project-json textarea");
+    const cmdEl  = $("#te-cmd-json textarea");
+    const prevEl = $("#te-preview-uri textarea");
+    if (!projEl || !cmdEl || !prevEl) return;
 
-              el.addEventListener('dragstart', (e) => {
-                e.dataTransfer.setData('text/plain', m.id);
-                e.dataTransfer.effectAllowed = 'copy';
-              });
+    const body = $("#app-body");
+    const toolsPanel = $("#tools-panel");
+    const tracksContent = $("#tracks-content");
+    const ruler = $("#time-ruler");
+    const playheadHead = $("#playhead-head");
+    const playheadLine = $("#playhead-line");
+    const mediaPool = $("#media-pool");
+    const dragOverlay = $("#drag-overlay");
+    const razorGuide = $("#razor-guide");
+    const effectPanel = $("#effect-panel");
+    const mainTimecode = $("#main-timecode");
+    const rulerTimecode = $("#ruler-tc");
+    const programPreview = $("#program-preview");
+    const btnImport = $("#btn-import");
+    const hiddenFileInput = $("#nle-upload input[type=file]");
 
-              pool.appendChild(el);
-            });
-          }
+    // Keep a small UI-only state (the authoritative state is project_json from backend)
+    const ui = {{
+      activeTool: "selection",
+      dragging: null, // {clipId, startX, startLeftPx}
+    }};
 
-          // -----------------------------
-          // Timeline rendering
-          // -----------------------------
-          function renderTimeline(p){
-            const ppf = p.px_per_frame || 2.0;
-            const fps = p.fps || 25.0;
+    function setCursor() {{
+      if (!body) return;
+      if (ui.activeTool === "razor") {{
+        body.classList.remove("cursor-select");
+        body.classList.add("cursor-razor");
+      }} else {{
+        body.classList.remove("cursor-razor");
+        body.classList.add("cursor-select");
+        if (razorGuide) razorGuide.style.display = "none";
+      }}
+    }}
 
-            // ruler marks (simple)
-            const marks = document.getElementById('ruler-marks');
-            if (marks && marks.childElementCount === 0){
-              for (let i=0;i<30;i++){
-                const span = document.createElement('span');
-                span.textContent = `00:00:${String(i).padStart(2,'0')}:00`;
-                marks.appendChild(span);
-              }
-            }
+    function renderRulerMarks() {{
+      const marks = $("#ruler-marks");
+      if (!marks) return;
+      if (marks.dataset.built === "1") return;
+      for (let i = 0; i < 30; i++) {{
+        const span = document.createElement("span");
+        span.innerText = `00:00:${{String(i).padStart(2,"0")}}:00`;
+        marks.appendChild(span);
+      }}
+      marks.dataset.built = "1";
+    }}
 
-            // update timecodes
-            const mainTc = document.getElementById('main-timecode');
-            const rulerTc = document.getElementById('ruler-tc');
-            if (mainTc) mainTc.textContent = frameToTimecode(p.playhead_f || 0, fps);
-            if (rulerTc) rulerTc.textContent = frameToTimecode(p.playhead_f || 0, fps);
+    function renderMediaPool(p) {{
+      if (!mediaPool || !dragOverlay) return;
+      mediaPool.innerHTML = "";
+      mediaPool.appendChild(dragOverlay);
 
-            // playhead positions
-            const playheadHead = document.getElementById('playhead-head');
-            const playheadLine = document.getElementById('playhead-line');
-            const timelineContainer = document.getElementById('timeline-container');
-            const timeRuler = document.getElementById('time-ruler');
+      const media = p.media || [];
+      const mc = $("#media-count");
+      if (mc) mc.innerText = `${{media.length}} élément(s)`;
 
-            const playX = Math.max(0, Math.round((p.playhead_f || 0) * ppf));
-            if (playheadHead) playheadHead.style.left = `${playX}px`;
-            if (playheadLine) playheadLine.style.left = `${playX + 160}px`;
+      if (media.length > 0) dragOverlay.style.display = "none";
+      else dragOverlay.style.display = "flex";
 
-            // clear tracks
-            document.querySelectorAll('.track').forEach(t => t.innerHTML = '');
+      media.forEach(item => {{
+        const el = document.createElement("div");
+        el.className = "w-24 flex flex-col gap-1 cursor-pointer p-1 rounded-sm hover:bg-[#2a2a2a] group";
+        el.draggable = true;
+        el.dataset.mediaId = item.id;
 
-            const clips = p.clips || [];
+        const isAudio = item.kind === "audio";
+        const isImage = item.kind === "image";
+        const icon = isAudio ? "ph-speaker-high" : isImage ? "ph-image" : "ph-film-strip";
+        const color = isAudio ? "text-[#339e66]" : "text-[#2d8ceb]";
+        const dur = (item.duration_s != null) ? `${{Number(item.duration_s).toFixed(1)}}s` : "00:00";
 
-            clips.forEach(c => {
-              const track = document.querySelector(`.track[data-track="${c.track_id}"]`);
-              if (!track) return;
+        el.innerHTML = `
+          <div class="relative w-full h-14 bg-black flex items-center justify-center overflow-hidden rounded-sm border border-[#333] group-hover:border-[#555]">
+            <i class="ph ${{icon}} text-2xl ${{color}} opacity-50"></i>
+            <div class="absolute bottom-0 right-0 bg-black/80 px-1 text-[9px] font-mono flex items-center gap-1 text-gray-300">
+              ${{dur}}
+            </div>
+          </div>
+          <span class="text-[9px] text-gray-300 truncate px-1" title="${{item.name}}">${{item.name}}</span>
+        `;
 
-              const el = document.createElement('div');
-              const durF = Math.max(1, (c.out_f - c.in_f));
-              const left = Math.max(0, Math.round((c.start_f || 0) * ppf));
-              const width = Math.max(6, Math.round(durF * ppf));
+        el.addEventListener("dragstart", (e) => {{
+          e.dataTransfer.setData("text/plain", item.id);
+          e.dataTransfer.effectAllowed = "copy";
+        }});
 
-              el.className = `clip ${c.kind} z-10`;
-              el.style.left = `${left}px`;
-              el.style.width = `${width}px`;
-              el.dataset.clipId = c.id;
+        mediaPool.appendChild(el);
+      }});
+    }}
 
-              el.innerHTML = `<span class="text-white text-[10px] truncate whitespace-nowrap drop-shadow-md pointer-events-none select-none px-1">${c.id}</span>`;
+    function renderTimeline(p) {{
+      renderRulerMarks();
 
-              el.addEventListener('mousedown', (e) => {
-                e.stopPropagation();
+      const fps = p.fps || 25.0;
+      const ppf = p.px_per_frame || 2.0;
 
-                pushCmd({ type:'SELECT_CLIP', clip_id: c.id });
+      // timecodes
+      const tc = frameToTimecode(p.playhead_f || 0, fps);
+      if (mainTimecode) mainTimecode.innerText = tc;
+      if (rulerTimecode) rulerTimecode.innerText = tc;
 
-                if (ui.activeTool === 'selection'){
-                  ui.dragging = { clipId: c.id, startX: e.clientX, startLeft: left };
-                  el.style.zIndex = '50';
-                } else if (ui.activeTool === 'razor'){
-                  const rect = el.getBoundingClientRect();
-                  const cutPx = e.clientX - rect.left;
-                  if (cutPx < 5 || cutPx > width - 5) return;
-                  const cutOffsetF = Math.round(cutPx / ppf);
-                  pushCmd({ type:'RAZOR_CUT', clip_id: c.id, cut_offset_f: cutOffsetF });
-                }
-              });
+      // sequence duration
+      const seqDurEl = $("#sequence-duration");
+      if (seqDurEl) {{
+        let maxEnd = 0;
+        (p.clips || []).forEach(c => {{
+          const dur = Math.max(1, (c.out_f - c.in_f));
+          maxEnd = Math.max(maxEnd, (c.start_f || 0) + dur);
+        }});
+        seqDurEl.innerText = frameToTimecode(maxEnd, fps);
+      }}
 
-              el.addEventListener('mousemove', (e) => {
-                if (ui.activeTool !== 'razor') return;
-                const razorGuide = document.getElementById('razor-guide');
-                if (!razorGuide) return;
-                const tracksRect = document.getElementById('tracks-content').getBoundingClientRect();
-                const relativeX = e.clientX - tracksRect.left;
-                razorGuide.style.display = 'block';
-                razorGuide.style.left = `${relativeX}px`;
-              });
+      // playhead visuals (keep your 160px header offset)
+      const playX = Math.max(0, Math.round((p.playhead_f || 0) * ppf));
+      if (playheadHead) playheadHead.style.left = `${{playX}}px`;
+      if (playheadLine) playheadLine.style.left = `${{playX + 160}}px`;
 
-              el.addEventListener('mouseleave', () => {
-                const razorGuide = document.getElementById('razor-guide');
-                if (razorGuide) razorGuide.style.display = 'none';
-              });
+      // clear tracks
+      document.querySelectorAll(".track").forEach(track => track.innerHTML = "");
 
-              track.appendChild(el);
-            });
+      // render clips
+      const clips = p.clips || [];
+      clips.forEach(c => {{
+        const track = document.querySelector(`.track[data-track="${{c.track_id}}"]`);
+        if (!track) return;
 
-            // enable dropping media onto tracks
-            document.querySelectorAll('.track').forEach(track => {
-              track.addEventListener('dragover', (e) => {
-                e.preventDefault();
-                e.dataTransfer.dropEffect = 'copy';
-              });
-              track.addEventListener('drop', (e) => {
-                e.preventDefault();
-                const mediaId = e.dataTransfer.getData('text/plain');
-                if (!mediaId) return;
+        const durF = Math.max(1, (c.out_f - c.in_f));
+        const leftPx = Math.max(0, Math.round((c.start_f || 0) * ppf));
+        const widthPx = Math.max(6, Math.round(durF * ppf));
 
-                const rect = track.getBoundingClientRect();
-                const leftPx = e.clientX - rect.left;
-                const startF = Math.max(0, Math.round(leftPx / ppf));
-                const trackId = track.dataset.track;
+        const clipEl = document.createElement("div");
+        clipEl.className = `clip ${{c.kind}} z-10`;
+        clipEl.style.left = `${{leftPx}}px`;
+        clipEl.style.width = `${{widthPx}}px`;
+        clipEl.dataset.clipId = c.id;
 
-                pushCmd({ type:'ADD_CLIP', media_id: mediaId, track_id: trackId, start_f: startF });
-              });
-            });
+        clipEl.innerHTML = `
+          <span class="text-white text-[10px] truncate whitespace-nowrap drop-shadow-md pointer-events-none select-none px-1">
+            ${{(findMediaName(p, c.media_id) || c.id)}}
+          </span>
+        `;
 
-            // playhead drag on ruler
-            if (timeRuler){
-              timeRuler.onmousedown = (e) => {
-                const rect = timeRuler.getBoundingClientRect();
-                const x = e.clientX - rect.left;
-                const frame = Math.max(0, Math.round(x / ppf));
-                pushCmd({ type:'SET_PLAYHEAD', frame: frame });
-                const move = (ev) => {
-                  const x2 = ev.clientX - rect.left;
-                  const frame2 = Math.max(0, Math.round(x2 / ppf));
-                  pushCmd({ type:'SET_PLAYHEAD', frame: frame2 });
-                };
-                const up = () => {
-                  document.removeEventListener('mousemove', move);
-                  document.removeEventListener('mouseup', up);
-                };
-                document.addEventListener('mousemove', move);
-                document.addEventListener('mouseup', up);
-              };
-            }
-          }
+        clipEl.addEventListener("mousedown", (e) => {{
+          e.stopPropagation();
+          sendCmd(cmdEl, {{ type: "SELECT_CLIP", clip_id: c.id }});
 
-          // global drag move commit
-          document.addEventListener('mousemove', (e) => {
-            if (!ui.dragging) return;
-            const p = safeParse(projEl.value);
-            if (!p) return;
-            const ppf = p.px_per_frame || 2.0;
+          if (ui.activeTool === "selection") {{
+            ui.dragging = {{
+              clipId: c.id,
+              startX: e.clientX,
+              startLeftPx: leftPx,
+            }};
+            clipEl.style.zIndex = "50";
+          }} else if (ui.activeTool === "razor") {{
+            const rect = clipEl.getBoundingClientRect();
+            const cutPx = e.clientX - rect.left;
+            if (cutPx < 5 || cutPx > widthPx - 5) return;
+            const cutOffF = Math.max(1, Math.min(durF - 1, Math.round(cutPx / ppf)));
+            sendCmd(cmdEl, {{ type: "RAZOR_CUT", clip_id: c.id, cut_offset_f: cutOffF }});
+            if (razorGuide) razorGuide.style.display = "none";
+          }}
+        }});
 
-            const dx = e.clientX - ui.dragging.startX;
-            const newLeft = Math.max(0, ui.dragging.startLeft + dx);
+        clipEl.addEventListener("mousemove", (e) => {{
+          if (ui.activeTool !== "razor") return;
+          if (!razorGuide || !tracksContent) return;
+          const tracksRect = tracksContent.getBoundingClientRect();
+          const relX = e.clientX - tracksRect.left;
+          razorGuide.style.display = "block";
+          razorGuide.style.left = `${{relX}}px`;
+        }});
 
-            const el = document.querySelector(`.clip[data-clip-id="${ui.dragging.clipId}"], .clip[data-clipid="${ui.dragging.clipId}"], .clip[data-clipId="${ui.dragging.clipId}"]`);
-            // our clips use dataset.clipId, so query:
-            const el2 = document.querySelector(`.clip[data-clip-id="${ui.dragging.clipId}"]`) || document.querySelector(`.clip[data-clipid="${ui.dragging.clipId}"]`) || document.querySelector(`.clip[data-clip-id="${ui.dragging.clipId}"]`);
-            // fallback: query by attribute we set:
-            const el3 = document.querySelector(`.clip[data-clipid="${ui.dragging.clipId}"]`);
-            const el4 = document.querySelector(`.clip[data-clip-id="${ui.dragging.clipId}"]`);
-            // Actually simplest:
-            const realEl = document.querySelector(`.clip[data-clip-id="${ui.dragging.clipId}"]`) || document.querySelector(`.clip[data-clipid="${ui.dragging.clipId}"]`) || document.querySelector(`.clip[data-clipid="${ui.dragging.clipId}"]`);
+        clipEl.addEventListener("mouseleave", () => {{
+          if (razorGuide) razorGuide.style.display = "none";
+        }});
 
-            const directEl = document.querySelector(`.clip[data-clip-id="${ui.dragging.clipId}"]`);
-            // We set "data-clip-id"? No: dataset.clipId => attribute "data-clip-id".
-            const clipEl = directEl || document.querySelector(`.clip[data-clip-id="${ui.dragging.clipId}"]`) || document.querySelector(`.clip[data-clip-id="${ui.dragging.clipId}"]`);
-            if (clipEl) clipEl.style.left = `${newLeft}px`;
-          });
+        track.appendChild(clipEl);
+      }});
 
-          document.addEventListener('mouseup', (e) => {
-            if (!ui.dragging) return;
-            const p = safeParse(projEl.value);
-            if (!p) { ui.dragging = null; return; }
-            const ppf = p.px_per_frame || 2.0;
+      // Enable drop media onto tracks
+      document.querySelectorAll(".track").forEach(track => {{
+        track.ondragover = (e) => {{
+          e.preventDefault();
+          track.classList.add("drag-over");
+        }};
+        track.ondragleave = (e) => {{
+          e.preventDefault();
+          track.classList.remove("drag-over");
+        }};
+        track.ondrop = (e) => {{
+          e.preventDefault();
+          track.classList.remove("drag-over");
+          const mediaId = e.dataTransfer.getData("text/plain");
+          if (!mediaId) return;
 
-            const dx = e.clientX - ui.dragging.startX;
-            const newLeft = Math.max(0, ui.dragging.startLeft + dx);
-            const newStartF = Math.max(0, Math.round(newLeft / ppf));
+          const rect = track.getBoundingClientRect();
+          const x = e.clientX - rect.left;
+          const startF = Math.max(0, Math.round(x / ppf));
+          const trackId = track.dataset.track;
+          sendCmd(cmdEl, {{ type: "ADD_CLIP", media_id: mediaId, track_id: trackId, start_f: startF }});
+        }};
+      }});
+    }}
 
-            pushCmd({ type:'MOVE_CLIP', clip_id: ui.dragging.clipId, start_f: newStartF });
-            ui.dragging = null;
-          });
+    function findMediaName(p, mediaId) {{
+      const m = (p.media || []).find(x => x.id === mediaId);
+      return m ? m.name : "";
+    }}
 
-          // tools
-          const tools = document.getElementById('tools-panel');
-          if (tools){
-            tools.addEventListener('click', (e) => {
-              const t = e.target.closest('.tool');
-              if (!t) return;
-              const tool = t.dataset.tool;
-              ui.activeTool = tool;
-              tools.querySelectorAll('.tool').forEach(x => x.classList.remove('tool-active','text-white'));
-              t.classList.add('tool-active','text-white');
-              setCursor();
-            });
-          }
+    function renderEffectControls(p) {{
+      if (!effectPanel) return;
+      const c = (p.clips || []).find(x => x.id === p.selected_clip_id);
+      if (!c) {{
+        effectPanel.innerHTML = `<span class="text-gray-500">(Sélectionnez un clip pour voir les paramètres FFmpeg)</span>`;
+        return;
+      }}
+      const m = (p.media || []).find(x => x.id === c.media_id);
+      const name = m ? m.name : c.id;
+      effectPanel.innerHTML = `
+        <div class="text-white font-medium mb-2 border-b border-[#333] pb-1">${{name}}</div>
+        <div class="flex flex-col gap-1 mb-3">
+          <div class="flex justify-between text-gray-400"><span>Scale</span> <span class="text-blue-400">100.0</span></div>
+          <div class="flex justify-between text-gray-400"><span>Position</span> <span class="text-blue-400">960.0, 540.0</span></div>
+          <div class="flex justify-between text-gray-400"><span>Opacity</span> <span class="text-blue-400">100%</span></div>
+        </div>
+        <div class="text-gray-500 mt-2 text-[9px] font-mono bg-[#111] p-2 rounded border border-[#222]">
+          > ffmpeg -i input -vf "scale=iw*1:ih*1" output
+        </div>
+      `;
+    }}
 
-          // import button -> hidden gradio file input
-          const btnImport = document.getElementById('btn-import');
-          if (btnImport){
-            btnImport.addEventListener('click', () => {
-              const fileInput = document.querySelector('#te-upload input[type="file"]');
-              if (fileInput) fileInput.click();
-            });
-          }
+    // Tool switching (English logic, UI unchanged)
+    if (toolsPanel) {{
+      toolsPanel.addEventListener("click", (e) => {{
+        const icon = e.target.closest("i");
+        if (!icon) return;
+        const tool = icon.dataset.tool;
+        if (tool !== "selection" && tool !== "razor") return;
 
-          // export
-          const btnExport = document.getElementById('btn-export');
-          if (btnExport){
-            btnExport.addEventListener('click', () => {
-              pushCmd({ type:'EXPORT' });
-            });
-          }
+        ui.activeTool = tool;
+        toolsPanel.querySelectorAll("i").forEach(i => i.classList.remove("tool-active", "text-white"));
+        icon.classList.add("tool-active", "text-white");
+        setCursor();
+      }});
+    }}
 
-          // preview uri -> set program image src
-          if (prevEl){
-            prevEl.addEventListener('input', () => {
-              const img = document.getElementById('program-preview');
-              const uri = prevEl.value || '';
-              if (img && uri.startsWith('data:image/')) img.src = uri;
-              if (img && !uri) img.removeAttribute('src');
-            });
-          }
+    // Ruler playhead drag
+    if (ruler) {{
+      ruler.addEventListener("mousedown", (e) => {{
+        const p = safeParse(projEl.value);
+        if (!p) return;
+        const rect = ruler.getBoundingClientRect();
+        const ppf = p.px_per_frame || 2.0;
 
-          // re-render when project updates
-          projEl.addEventListener('input', () => {
-            const p = safeParse(projEl.value);
-            if (!p) return;
-            renderMediaPool(p);
-            renderTimeline(p);
-          });
+        const setFromX = (x) => {{
+          const frame = Math.max(0, Math.round(x / ppf));
+          sendCmd(cmdEl, {{ type: "SET_PLAYHEAD", frame: frame }});
+        }};
 
-          // first render
-          (function init(){
-            setCursor();
-            const p = safeParse(projEl.value);
-            if (!p) return;
-            renderMediaPool(p);
-            renderTimeline(p);
-          })();
-        }
-        """
+        setFromX(e.clientX - rect.left);
 
-        with gr.Blocks(css=css) as root:
-            # Hidden state bridge
-            project_json = gr.Textbox(
-                value=dumps_project(default_project()),
-                visible=False,
-                elem_id="te-project-json",
-            )
-            cmd_json = gr.Textbox(value="", visible=False, elem_id="te-cmd-json")
-            preview_uri = gr.Textbox(value="", visible=False, elem_id="te-preview-uri")
+        const move = (ev) => setFromX(ev.clientX - rect.left);
+        const up = () => {{
+          document.removeEventListener("mousemove", move);
+          document.removeEventListener("mouseup", up);
+        }};
+        document.addEventListener("mousemove", move);
+        document.addEventListener("mouseup", up);
+      }});
+    }}
 
-            # Hidden uploader (used by your Import button)
-            uploader = gr.File(
-                label="Uploader",
-                file_count="multiple",
-                visible=False,
-                elem_id="te-upload",
-            )
+    // Clip dragging: horizontal + track change (real, commit on mouseup)
+    document.addEventListener("mousemove", (e) => {{
+      if (!ui.dragging) return;
+      const p = safeParse(projEl.value);
+      if (!p) return;
 
-            # Render the UI
-            gr.HTML(ui_html)
+      const dx = e.clientX - ui.dragging.startX;
+      const newLeft = Math.max(0, ui.dragging.startLeftPx + dx);
 
-            # Inject JS after DOM is ready
+      const el = document.querySelector(`.clip[data-clip-id="${{ui.dragging.clipId}}"]`);
+      if (el) el.style.left = `${{newLeft}}px`;
+    }});
+
+    document.addEventListener("mouseup", (e) => {{
+      if (!ui.dragging) return;
+
+      const p = safeParse(projEl.value);
+      if (!p) {{
+        ui.dragging = null;
+        return;
+      }}
+
+      const dx = e.clientX - ui.dragging.startX;
+      const newLeft = Math.max(0, ui.dragging.startLeftPx + dx);
+      const ppf = p.px_per_frame || 2.0;
+      const newStartF = Math.max(0, Math.round(newLeft / ppf));
+
+      // detect track under pointer (move between tracks)
+      let newTrack = null;
+      const elUnder = document.elementFromPoint(e.clientX, e.clientY);
+      if (elUnder) {{
+        const trackEl = elUnder.closest(".track");
+        if (trackEl && trackEl.dataset.track) newTrack = trackEl.dataset.track;
+      }}
+
+      sendCmd(cmdEl, {{
+        type: "MOVE_CLIP",
+        clip_id: ui.dragging.clipId,
+        start_f: newStartF,
+        track_id: newTrack
+      }});
+
+      const el = document.querySelector(`.clip[data-clip-id="${{ui.dragging.clipId}}"]`);
+      if (el) el.style.zIndex = "10";
+
+      ui.dragging = null;
+    }});
+
+    // Media pool drag&drop import area (kept, but real import uses hidden file input)
+    if (mediaPool && dragOverlay) {{
+      mediaPool.addEventListener("dragover", (e) => {{
+        e.preventDefault();
+        mediaPool.classList.add("drag-over");
+        dragOverlay.style.zIndex = "10";
+      }});
+      mediaPool.addEventListener("dragleave", (e) => {{
+        e.preventDefault();
+        mediaPool.classList.remove("drag-over");
+        dragOverlay.style.zIndex = "0";
+      }});
+    }}
+
+    // Import button (click hidden file input)
+    if (btnImport && hiddenFileInput) {{
+      btnImport.addEventListener("click", () => hiddenFileInput.click());
+    }}
+
+    // Preview URI -> program image
+    prevEl.addEventListener("input", () => {{
+      const uri = prevEl.value || "";
+      if (programPreview && uri.startsWith("data:image/")) {{
+        programPreview.src = uri;
+        programPreview.style.opacity = "1";
+        programPreview.classList.remove("mix-blend-lighten");
+      }}
+    }});
+
+    // Project changes -> rerender
+    projEl.addEventListener("input", () => {{
+      const p = safeParse(projEl.value);
+      if (!p) return;
+      renderMediaPool(p);
+      renderTimeline(p);
+      renderEffectControls(p);
+    }});
+
+    // First render
+    const p0 = safeParse(projEl.value);
+    if (p0) {{
+      setCursor();
+      renderMediaPool(p0);
+      renderTimeline(p0);
+      renderEffectControls(p0);
+    }}
+  }}
+
+  async function init() {{
+    const mountOk = mountUI();
+    if (!mountOk) return;
+
+    // Load Tailwind AFTER mount so it can see classes
+    await ensureAssets();
+
+    // Avoid double init
+    const mount = document.getElementById("nle-mount");
+    if (mount && mount.dataset.inited === "1") return;
+    if (mount) mount.dataset.inited = "1";
+
+    appInit();
+  }}
+
+  init();
+  const obs = new MutationObserver(() => init());
+  obs.observe(document.body, {{ childList: true, subtree: true }});
+}}
+"""
+
+        with gr.Blocks() as root:
+            gr.HTML(mount_container)
+            project_json.render()
+            cmd_json.render()
+            preview_uri.render()
+            uploader.render()
+
             root.load(fn=None, js=js)
 
-            def detect_kind(path: str) -> str:
+            def _detect_kind(path: str) -> str:
                 hv = getattr(self, "has_video_file_extension", None)
                 hi = getattr(self, "has_image_file_extension", None)
                 ha = getattr(self, "has_audio_file_extension", None)
@@ -774,23 +958,26 @@ class TimelineEditorPlugin(WAN2GPPlugin):
                     return "image"
                 if callable(ha) and ha(path):
                     return "audio"
-                return "video"  # fallback
+                # fallback
+                return "video"
 
-            def add_uploaded_files(files, raw_proj: str):
-                p = loads_project(raw_proj)
-
-                if not files:
-                    return raw_proj, ""
-
+            def _uid() -> str:
                 uid_fn = getattr(self, "get_unique_id", None)
-                get_uid = (lambda: str(uid_fn())) if callable(uid_fn) else (lambda: str(abs(hash(os.urandom(16)))))
+                if callable(uid_fn):
+                    return str(uid_fn())
+                return f"id_{abs(hash(os.urandom(16)))}"
+
+            def on_upload(files, raw_proj: str):
+                p = loads_project(raw_proj)
+                if not files:
+                    return raw_proj, compute_preview_uri(self, p)
 
                 for f in files:
                     path = getattr(f, "name", None) or str(f)
                     name = os.path.basename(path)
-                    kind = detect_kind(path)
+                    kind = _detect_kind(path)
 
-                    item = MediaItem(id=get_uid(), path=path, name=name, kind=kind)
+                    item = MediaItem(id=_uid(), name=name, path=path, kind=kind)
 
                     try:
                         if kind == "video":
@@ -798,18 +985,15 @@ class TimelineEditorPlugin(WAN2GPPlugin):
                             if callable(info_fn):
                                 info = info_fn(path)
                                 if isinstance(info, (list, tuple)) and len(info) >= 4:
-                                    fps, w, h, frame_count = info[:4]
+                                    fps, _w, _h, frame_count = info[:4]
                                     item.fps = float(fps) if fps else None
-                                    item.w = int(w) if w else None
-                                    item.h = int(h) if h else None
                                     item.frames = int(frame_count) if frame_count else None
                                     if item.fps and item.frames is not None:
                                         item.duration_s = float(item.frames) / float(item.fps)
 
                         elif kind == "image":
                             img = Image.open(path)
-                            item.w, item.h = img.size
-                            # default still duration (no native duration)
+                            # default still duration
                             item.duration_s = 2.0
                             item.frames = int(round(item.duration_s * p.fps))
 
@@ -824,22 +1008,19 @@ class TimelineEditorPlugin(WAN2GPPlugin):
                     p.media.append(item)
 
                 raw2 = dumps_project(p)
-                # update preview from current playhead (might still be None)
-                prev = compute_preview_frame_uri(self, p) or ""
+                prev = compute_preview_uri(self, p)
                 return raw2, prev
 
-            def handle_cmd(raw_cmd: str, raw_proj: str):
-                if not raw_cmd:
-                    p = loads_project(raw_proj)
-                    prev = compute_preview_frame_uri(self, p) or ""
-                    return raw_proj, prev, ""
-
+            def on_cmd(raw_cmd: str, raw_proj: str):
                 p = loads_project(raw_proj)
+
+                if not raw_cmd:
+                    return raw_proj, compute_preview_uri(self, p), ""
+
                 try:
                     cmd = json.loads(raw_cmd)
                 except Exception:
-                    prev = compute_preview_frame_uri(self, p) or ""
-                    return raw_proj, prev, ""
+                    return raw_proj, compute_preview_uri(self, p), ""
 
                 t = cmd.get("type")
 
@@ -849,32 +1030,27 @@ class TimelineEditorPlugin(WAN2GPPlugin):
                 elif t == "SELECT_CLIP":
                     p.selected_clip_id = cmd.get("clip_id")
 
-                elif t == "MOVE_CLIP":
-                    cid = cmd.get("clip_id")
-                    new_start = max(0, int(cmd.get("start_f", 0)))
-                    for c in p.clips:
-                        if c.id == cid:
-                            c.start_f = new_start
-                            break
-
                 elif t == "ADD_CLIP":
                     media_id = cmd.get("media_id")
                     track_id = cmd.get("track_id", "V1")
                     start_f = max(0, int(cmd.get("start_f", 0)))
+
                     m = find_media(p, media_id)
                     if m:
-                        # enforce type vs track
+                        # enforce track type
                         if track_id.startswith("A") and m.kind != "audio":
-                            # ignore invalid drop
                             pass
                         elif track_id.startswith("V") and m.kind == "audio":
                             pass
                         else:
-                            # default duration
+                            # default duration: 5 seconds for video if unknown, else media duration
                             if m.frames is not None:
                                 dur_f = max(1, int(m.frames))
+                                # for long videos, don't drop full duration by default
+                                if m.kind == "video":
+                                    dur_f = min(dur_f, int(round(p.fps * 5.0)))
                             else:
-                                dur_f = max(1, int(round(2.0 * p.fps)))
+                                dur_f = int(round(p.fps * 2.0))
 
                             clip_id = f"c_{abs(hash(os.urandom(8)))}"
                             c = Clip(
@@ -889,19 +1065,32 @@ class TimelineEditorPlugin(WAN2GPPlugin):
                             p.clips.append(c)
                             p.selected_clip_id = clip_id
 
+                elif t == "MOVE_CLIP":
+                    cid = cmd.get("clip_id")
+                    new_start = max(0, int(cmd.get("start_f", 0)))
+                    new_track = cmd.get("track_id")  # may be null
+
+                    for c in p.clips:
+                        if c.id == cid:
+                            c.start_f = new_start
+                            if isinstance(new_track, str) and new_track:
+                                # validate track change: video/image must go to V, audio to A
+                                if new_track.startswith("V") and c.kind in ("video", "image"):
+                                    c.track_id = new_track
+                                elif new_track.startswith("A") and c.kind == "audio":
+                                    c.track_id = new_track
+                            break
+
                 elif t == "RAZOR_CUT":
                     cid = cmd.get("clip_id")
                     cut_off = int(cmd.get("cut_offset_f", 0))
-                    target = None
-                    for c in p.clips:
-                        if c.id == cid:
-                            target = c
-                            break
+
+                    target = find_clip(p, cid)
                     if target:
-                        dur = max(1, target.out_f - target.in_f)
-                        # clamp cut within clip
+                        dur = clip_duration_frames(target)
                         cut_off = max(1, min(dur - 1, cut_off))
-                        # first part: same id, shorten out
+
+                        # first segment stays same id (shorten)
                         first = target
                         second_id = f"{first.id}_b"
                         second = Clip(
@@ -914,31 +1103,26 @@ class TimelineEditorPlugin(WAN2GPPlugin):
                             kind=first.kind,
                         )
                         first.out_f = first.in_f + cut_off
-                        # replace
+
                         p.clips = [c for c in p.clips if c.id != first.id]
                         p.clips.append(first)
                         p.clips.append(second)
                         p.selected_clip_id = first.id
 
-                elif t == "EXPORT":
-                    # Real export is heavy; wire it later to an explicit output file component.
-                    # For now: do nothing here (still "real editor" because state is real).
-                    pass
-
                 raw2 = dumps_project(p)
-                prev = compute_preview_frame_uri(self, p) or ""
+                prev = compute_preview_uri(self, p)
                 return raw2, prev, ""
 
             uploader.change(
-                add_uploaded_files,
+                on_upload,
                 inputs=[uploader, project_json],
                 outputs=[project_json, preview_uri],
             )
 
             cmd_json.change(
-                handle_cmd,
+                on_cmd,
                 inputs=[cmd_json, project_json],
-                outputs=[project_json, preview_uri, cmd_json],  # clear cmd
+                outputs=[project_json, preview_uri, cmd_json],
             )
 
         return root
