@@ -441,9 +441,10 @@ class TimelineEditorPlugin(WAN2GPPlugin):
   .cursor-select { cursor: default !important; }
   .razor-line { position: absolute; top: 0; bottom: 0; width: 1px; background: red; pointer-events: none; z-index: 50; display: none; }
 
-  /* Hidden items */
+  /* Hidden items safeguards */
   #preview-timecode { display: none !important; }
   #tab-explorer { display: none !important; }
+  #te-project-json, #te-cmd-json, #te-preview-uri { display: none !important; }
 
   /* Media Pool Uploader Overlay */
   #nle-upload {
@@ -1049,11 +1050,13 @@ function() {{
             gr.HTML(mount_container)
 
             # Instantiation directe à l'intérieur du Block
-            project_json = gr.Textbox(value=dumps_project(default_project()), visible=False, elem_id="te-project-json")
-            cmd_json = gr.Textbox(value="", visible=False, elem_id="te-cmd-json")
-            preview_uri = gr.Textbox(value="", visible=False, elem_id="te-preview-uri")
-            # Composant Gradio File pour l'upload natif rendu visible pour l'Overlay CSS
-            uploader = gr.File(label="Uploader", file_count="multiple", visible=True, elem_id="nle-upload")
+            project_json = gr.Textbox(value=dumps_project(default_project()), visible="hidden", elem_id="te-project-json")
+            cmd_json = gr.Textbox(value="", visible="hidden", elem_id="te-cmd-json")
+            preview_uri = gr.Textbox(value="", visible="hidden", elem_id="te-preview-uri")
+            
+            # Composant Gradio File pour l'upload natif 
+            # Il renvoie désormais des listes de chemins de fichiers via type="filepath"
+            uploader = gr.File(label="Uploader", file_count="multiple", visible="hidden", elem_id="nle-upload", type="filepath")
 
             root.load(fn=None, js=js)
 
@@ -1227,13 +1230,13 @@ function() {{
                 prev = compute_preview_uri(self, p)
                 return raw2, prev, ""
 
-            uploader.change(
+            uploader.upload(
                 on_upload,
                 inputs=[uploader, project_json],
                 outputs=[project_json, preview_uri],
             )
 
-            cmd_json.change(
+            cmd_json.input(
                 on_cmd,
                 inputs=[cmd_json, project_json],
                 outputs=[project_json, preview_uri, cmd_json],
