@@ -1,8 +1,3 @@
 {
   "name": "Wan2GP Timeline Editor Plugin",
   "id": "wan2gp-timeline-editor",
-  "author": "Wan2GP Community",
-  "version": "0.1.0",
-  "description": "NLE-style multi-track timeline editor tab for Wan2GP.",
-  "wan2gp_version": ">=10.90.0"
-}
