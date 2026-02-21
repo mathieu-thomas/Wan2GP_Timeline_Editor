@@ -205,22 +205,9 @@ class TimelineEditorPlugin(WAN2GPPlugin):
         self.request_component("state")
 
     def create_ui(self):
-        # Keep UI exactly (markup), but do NOT rely on <head> scripts.
-        # We mount the body HTML into #nle-mount, then load Tailwind/Phosphor in root.load(js=...).
         mount_container = "<div id='nle-mount'></div>"
 
-        # Hidden bridges
-        project_json = gr.Textbox(value=dumps_project(default_project()), visible=False, elem_id="te-project-json")
-        cmd_json = gr.Textbox(value="", visible=False, elem_id="te-cmd-json")
-        preview_uri = gr.Textbox(value="", visible=False, elem_id="te-preview-uri")
-
-        # Hidden uploader used by the UI button (Import)
-        uploader = gr.File(label="Uploader", file_count="multiple", visible=False, elem_id="nle-upload")
-
         # Your HTML "body" (NO <!DOCTYPE>, NO <html>, NO <head>, NO external <script src=...>, NO inline <script>).
-        # UI stays the same visually. We only add:
-        # - id hooks (already present)
-        # - we will hide Explorer + preview timestamp via CSS in JS stage (no markup change).
         UI_BODY_HTML = r"""
 <main class="flex-1 flex flex-col min-h-0">
     <!-- MOITIÉ SUPÉRIEURE -->
@@ -272,7 +259,7 @@ class TimelineEditorPlugin(WAN2GPPlugin):
                     <div class="flex items-center gap-4 text-gray-400 text-lg">
                         <i class="ph ph-brackets-angle hover:text-white cursor-pointer"></i>
                         <i class="ph ph-skip-back hover:text-white cursor-pointer"></i>
-                        <i class="ph-fill ph-play hover:text-white cursor-pointer text-xl"></i>
+                        <i class="ph-fill ph-play hover:text-white cursor-pointer text-xl" id="btn-play"></i>
                         <i class="ph ph-skip-forward hover:text-white cursor-pointer"></i>
                         <i class="ph ph-camera hover:text-white cursor-pointer"></i>
                     </div>
@@ -690,6 +677,11 @@ function() {{
         clipEl.style.width = `${{widthPx}}px`;
         clipEl.dataset.clipId = c.id;
 
+        // Visual selection indicator
+        if (p.selected_clip_id === c.id) {{
+            clipEl.style.border = "1px solid white";
+        }}
+
         clipEl.innerHTML = `
           <span class="text-white text-[10px] truncate whitespace-nowrap drop-shadow-md pointer-events-none select-none px-1">
             ${{(findMediaName(p, c.media_id) || c.id)}}
@@ -785,6 +777,76 @@ function() {{
       `;
     }}
 
+    // Playback loop handler
+    let playing = false;
+    let lastSync = 0;
+
+    function togglePlay() {{
+      playing = !playing;
+      const playBtnIcon = document.getElementById("btn-play");
+      if (playBtnIcon) {{
+        if (playing) {{
+          playBtnIcon.classList.remove("ph-play");
+          playBtnIcon.classList.add("ph-pause");
+        }} else {{
+          playBtnIcon.classList.remove("ph-pause");
+          playBtnIcon.classList.add("ph-play");
+        }}
+      }}
+
+      if (!playing) return;
+
+      const tickMs = 40; // ~25fps clock
+      const syncEveryMs = 120; // backend preview throttle (~8fps)
+
+      const loop = () => {{
+        if (!playing) return;
+
+        const p = safeParse(projEl.value);
+        if (!p) return;
+
+        const fps = p.fps || 25.0;
+        const nextFrame = (p.playhead_f || 0) + 1;
+        
+        // optimistically update playhead locally to stop backward stutter
+        p.playhead_f = nextFrame;
+        projEl.value = JSON.stringify(p);
+
+        // sync with backend periodically
+        const now = Date.now();
+        if (now - lastSync >= syncEveryMs) {{
+          lastSync = now;
+          sendCmd(cmdEl, {{ type: "SET_PLAYHEAD", frame: nextFrame }});
+        }} else {{
+          // Local playhead update without generating thumbnail
+          const tc = frameToTimecode(nextFrame, fps);
+          if (mainTimecode) mainTimecode.innerText = tc;
+          if (rulerTimecode) rulerTimecode.innerText = tc;
+
+          const ppf = p.px_per_frame || 2.0;
+          const playX = Math.max(0, Math.round(nextFrame * ppf));
+          if (playheadHead) playheadHead.style.left = `${{playX}}px`;
+          if (playheadLine) playheadLine.style.left = `${{playX + 160}}px`;
+        }}
+
+        setTimeout(loop, tickMs);
+      }};
+
+      loop();
+    }}
+
+    const playBtn = document.getElementById("btn-play");
+    if (playBtn) playBtn.addEventListener("click", togglePlay);
+
+    // Delete Clip Hotkey Handler
+    document.addEventListener("keydown", (e) => {{
+      if (e.key === "Delete" || e.key === "Backspace") {{
+        // Evite de supprimer si on est dans un champ texte
+        if (document.activeElement && (document.activeElement.tagName === "INPUT" || document.activeElement.tagName === "TEXTAREA")) return;
+        sendCmd(cmdEl, {{ type: "DELETE_SELECTED" }});
+      }}
+    }});
+
     // Tool switching (English logic, UI unchanged)
     if (toolsPanel) {{
       toolsPanel.addEventListener("click", (e) => {{
@@ -803,6 +865,9 @@ function() {{
     // Ruler playhead drag
     if (ruler) {{
       ruler.addEventListener("mousedown", (e) => {{
+        // Auto-pause when scrubbing
+        if (playing) togglePlay(); 
+
         const p = safeParse(projEl.value);
         if (!p) return;
         const rect = ruler.getBoundingClientRect();
@@ -942,12 +1007,16 @@ function() {{
 }}
 """
 
+        # Les composants Gradio cachés qui causent DuplicateBlockError
+        # doivent être définis *à l'intérieur* du bloc `gr.Blocks` sans `.render()` 
         with gr.Blocks() as root:
             gr.HTML(mount_container)
-            project_json.render()
-            cmd_json.render()
-            preview_uri.render()
-            uploader.render()
+
+            # Instantiation directe à l'intérieur du Block
+            project_json = gr.Textbox(value=dumps_project(default_project()), visible=False, elem_id="te-project-json")
+            cmd_json = gr.Textbox(value="", visible=False, elem_id="te-cmd-json")
+            preview_uri = gr.Textbox(value="", visible=False, elem_id="te-preview-uri")
+            uploader = gr.File(label="Uploader", file_count="multiple", visible=False, elem_id="nle-upload")
 
             root.load(fn=None, js=js)
 
@@ -1032,6 +1101,11 @@ function() {{
 
                 elif t == "SELECT_CLIP":
                     p.selected_clip_id = cmd.get("clip_id")
+                    
+                elif t == "DELETE_SELECTED":
+                    if p.selected_clip_id:
+                        p.clips = [c for c in p.clips if c.id != p.selected_clip_id]
+                        p.selected_clip_id = None
 
                 elif t == "ADD_CLIP":
                     media_id = cmd.get("media_id")
