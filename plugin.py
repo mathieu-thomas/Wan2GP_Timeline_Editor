@@ -5,6 +5,7 @@ import io
 import json
 import os
 import subprocess
+import tempfile
 from dataclasses import asdict, dataclass
 from typing import Any, Dict, List, Optional
 
@@ -148,25 +149,22 @@ def track_priority(track_id: str) -> int:
     return -999
 
 
-def compute_preview_uri(plugin: "TimelineEditorPlugin", p: Project) -> str:
-    """
-    Real preview: choose topmost (highest V-track) video/image clip under playhead and render a frame/image.
-    """
+def _get_preview_image(plugin: "TimelineEditorPlugin", p: Project) -> Optional[Image.Image]:
+    """Helper to get the actual PIL Image for the current playhead frame"""
     frame = p.playhead_f
     candidates = [c for c in p.clips if c.kind in ("video", "image") and clip_covers_frame(c, frame)]
     if not candidates:
-        return ""
+        return None
 
     candidates.sort(key=lambda c: track_priority(c.track_id), reverse=True)
     top = candidates[0]
     m = find_media(p, top.media_id)
     if not m:
-        return ""
+        return None
 
     try:
         if top.kind == "image":
-            img = Image.open(m.path).convert("RGB")
-            return pil_to_data_uri(img, "PNG")
+            return Image.open(m.path).convert("RGB")
 
         # video
         media_frame = top.in_f + (frame - top.start_f)
@@ -174,10 +172,20 @@ def compute_preview_uri(plugin: "TimelineEditorPlugin", p: Project) -> str:
         if callable(get_frame):
             pil_img = get_frame(m.path, int(media_frame), return_PIL=True)
             if isinstance(pil_img, Image.Image):
-                return pil_to_data_uri(pil_img, "PNG")
-        return ""
+                return pil_img
     except Exception:
-        return ""
+        pass
+    return None
+
+
+def compute_preview_uri(plugin: "TimelineEditorPlugin", p: Project) -> str:
+    """
+    Real preview: choose topmost (highest V-track) video/image clip under playhead and render a frame/image.
+    """
+    img = _get_preview_image(plugin, p)
+    if img:
+        return pil_to_data_uri(img, "PNG")
+    return ""
 
 
 # =========================
@@ -256,11 +264,10 @@ class TimelineEditorPlugin(WAN2GPPlugin):
                     </div>
 
                     <div class="flex items-center gap-4 text-gray-400 text-lg">
-                        <i class="ph ph-brackets-angle hover:text-white cursor-pointer"></i>
-                        <i class="ph ph-skip-back hover:text-white cursor-pointer"></i>
-                        <i class="ph-fill ph-play hover:text-white cursor-pointer text-xl"></i>
-                        <i class="ph ph-skip-forward hover:text-white cursor-pointer"></i>
-                        <i class="ph ph-camera hover:text-white cursor-pointer"></i>
+                        <i class="ph ph-skip-back hover:text-white cursor-pointer" id="btn-home"></i>
+                        <i class="ph-fill ph-play hover:text-white cursor-pointer text-xl" id="btn-play"></i>
+                        <i class="ph ph-skip-forward hover:text-white cursor-pointer" id="btn-end"></i>
+                        <i class="ph ph-camera hover:text-white cursor-pointer" id="btn-screenshot"></i>
                     </div>
 
                     <div class="flex items-center gap-3 text-gray-400">
@@ -556,10 +563,137 @@ function() {{
     const btnImport = $("#btn-import");
     const hiddenFileInput = $("#nle-upload input[type='file']") || $("#nle-upload input");
 
+    // Transport buttons
+    const btnHome = $("#btn-home");
+    const btnPlay = $("#btn-play");
+    const btnEnd = $("#btn-end");
+    const btnScreenshot = $("#btn-screenshot");
+
     const ui = {{
       activeTool: "selection",
       dragging: null,
     }};
+
+    // Playback state
+    let playing = false;
+    let rafId = null;
+    let lastTs = performance.now();
+    let accumMs = 0;
+    let lastBackendSyncTs = 0;
+
+    function getMaxEndFrame(p) {{
+      let maxEnd = 0;
+      (p.clips || []).forEach(c => {{
+        const dur = Math.max(1, (c.out_f - c.in_f));
+        maxEnd = Math.max(maxEnd, (c.start_f || 0) + dur);
+      }});
+      return maxEnd;
+    }}
+
+    function playbackLoop(ts) {{
+      if (!playing) return;
+      rafId = requestAnimationFrame(playbackLoop);
+
+      const dt = ts - lastTs;
+      lastTs = ts;
+      // Cap dt so returning to tab doesn't jump forward crazily
+      accumMs += Math.min(dt, 100);
+
+      const p = safeParse(projEl.value);
+      if (!p) return;
+
+      const fps = p.fps || 25.0;
+      const frameMs = 1000 / fps;
+      const maxEnd = getMaxEndFrame(p);
+      let updated = false;
+
+      while (accumMs >= frameMs) {{
+        accumMs -= frameMs;
+        if (p.playhead_f < maxEnd) {{
+          p.playhead_f++;
+          updated = true;
+        }} else {{
+          playing = false;
+          if (btnPlay) btnPlay.classList.replace("ph-pause", "ph-play");
+          break;
+        }}
+      }}
+
+      if (updated) {{
+        const newRaw = JSON.stringify(p);
+        projEl.value = newRaw;
+        lastProjRaw = newRaw; // Prevent interval from doing a full DOM rebuild of the timeline
+
+        const tc = frameToTimecode(p.playhead_f, fps);
+        if (mainTimecode) mainTimecode.innerText = tc;
+        if (rulerTimecode) rulerTimecode.innerText = tc;
+
+        const ppf = p.px_per_frame || 2.0;
+        const playX = Math.max(0, Math.round(p.playhead_f * ppf));
+        if (playheadHead) playheadHead.style.left = `${{playX}}px`;
+        if (playheadLine) playheadLine.style.left = `${{playX + 160}}px`;
+
+        if (ts - lastBackendSyncTs > 120) {{
+          lastBackendSyncTs = ts;
+          sendCmd(cmdEl, {{ type: "SET_PLAYHEAD", frame: p.playhead_f }});
+        }}
+      }}
+    }}
+
+    function togglePlay() {{
+      playing = !playing;
+      if (playing) {{
+        if (btnPlay) btnPlay.classList.replace("ph-play", "ph-pause");
+        const p = safeParse(projEl.value);
+        const maxEnd = p ? getMaxEndFrame(p) : 0;
+        if (p && p.playhead_f >= maxEnd) {{
+          p.playhead_f = 0;
+          const newRaw = JSON.stringify(p);
+          projEl.value = newRaw;
+          lastProjRaw = newRaw;
+        }}
+        lastTs = performance.now();
+        accumMs = 0;
+        rafId = requestAnimationFrame(playbackLoop);
+      }} else {{
+        if (btnPlay) btnPlay.classList.replace("ph-pause", "ph-play");
+        if (rafId) cancelAnimationFrame(rafId);
+        const p = safeParse(projEl.value);
+        if (p) sendCmd(cmdEl, {{ type: "SET_PLAYHEAD", frame: p.playhead_f }});
+      }}
+    }}
+
+    if (btnPlay) btnPlay.addEventListener("click", () => togglePlay());
+
+    if (btnHome) {{
+      btnHome.addEventListener("click", () => {{
+        if (playing) togglePlay();
+        sendCmd(cmdEl, {{ type: "SET_PLAYHEAD", frame: 0 }});
+      }});
+    }}
+
+    if (btnEnd) {{
+      btnEnd.addEventListener("click", () => {{
+        if (playing) togglePlay();
+        const p = safeParse(projEl.value);
+        if (p) sendCmd(cmdEl, {{ type: "SET_PLAYHEAD", frame: getMaxEndFrame(p) }});
+      }});
+    }}
+
+    if (btnScreenshot) {{
+      btnScreenshot.addEventListener("click", () => {{
+        sendCmd(cmdEl, {{ type: "SCREENSHOT" }});
+        const toast = document.createElement("div");
+        toast.innerText = "Screenshot captured! (Downloading...)";
+        toast.className = "absolute top-4 left-1/2 -translate-x-1/2 bg-[#2d8ceb]/90 text-white px-3 py-1 rounded text-xs shadow-lg z-50 transition-opacity duration-500 pointer-events-none";
+        const pm = $("#program-preview")?.parentElement;
+        if (pm) {{
+          pm.appendChild(toast);
+          setTimeout(() => toast.style.opacity = "0", 2000);
+          setTimeout(() => toast.remove(), 2500);
+        }}
+      }});
+    }}
 
     function setCursor() {{
       if (!body) return;
@@ -641,12 +775,7 @@ function() {{
 
       const seqDurEl = $("#sequence-duration");
       if (seqDurEl) {{
-        let maxEnd = 0;
-        (p.clips || []).forEach(c => {{
-          const dur = Math.max(1, (c.out_f - c.in_f));
-          maxEnd = Math.max(maxEnd, (c.start_f || 0) + dur);
-        }});
-        seqDurEl.innerText = frameToTimecode(maxEnd, fps);
+        seqDurEl.innerText = frameToTimecode(getMaxEndFrame(p), fps);
       }}
 
       const playX = Math.max(0, Math.round((p.playhead_f || 0) * ppf));
@@ -677,6 +806,7 @@ function() {{
         `;
 
         clipEl.addEventListener("mousedown", (e) => {{
+          if (playing) togglePlay();
           e.stopPropagation();
           sendCmd(cmdEl, {{ type: "SELECT_CLIP", clip_id: c.id }});
 
@@ -786,6 +916,7 @@ function() {{
 
     if (ruler) {{
       ruler.addEventListener("mousedown", (e) => {{
+        if (playing) togglePlay();
         const p = safeParse(projEl.value);
         if (!p) return;
         const rect = ruler.getBoundingClientRect();
@@ -873,12 +1004,14 @@ function() {{
     // State sync loop
     let lastProjRaw = null;
     let lastPrevUri = null;
+    let lastScreenshotHref = null;
 
     setInterval(() => {{
+      // Update from backend json only if not currently managing playhead smoothly via RAF
       if (projEl && projEl.value !== lastProjRaw) {{
         lastProjRaw = projEl.value;
         const p = safeParse(lastProjRaw);
-        if (p) {{
+        if (p && !playing) {{
           renderMediaPool(p);
           renderTimeline(p);
           renderEffectControls(p);
@@ -900,15 +1033,25 @@ function() {{
           }}
         }}
       }}
+
+      // Check for invisible automatic download (screenshot requested from backend)
+      const fileLink = document.querySelector("#te-screenshot-file a");
+      if (fileLink && fileLink.href && fileLink.href !== lastScreenshotHref) {{
+        lastScreenshotHref = fileLink.href;
+        fileLink.click();
+      }}
+
     }}, 100);
 
     // Initial render bindings (fallback)
     projEl.addEventListener("input", () => {{
       const p = safeParse(projEl.value);
       if (!p) return;
-      renderMediaPool(p);
-      renderTimeline(p);
-      renderEffectControls(p);
+      if (!playing) {{
+        renderMediaPool(p);
+        renderTimeline(p);
+        renderEffectControls(p);
+      }}
     }});
 
     prevEl.addEventListener("input", () => {{
@@ -956,6 +1099,7 @@ function() {{
                 cmd_json = gr.Textbox(value="", elem_id="te-cmd-json")
                 preview_uri = gr.Textbox(value="", elem_id="te-preview-uri")
                 uploader = gr.File(label="Uploader", file_count="multiple", type="filepath", elem_id="nle-upload")
+                screenshot_file = gr.File(label="Screenshot", visible=False, elem_id="te-screenshot-file")
 
             root.load(fn=None, js=js)
 
@@ -1022,19 +1166,28 @@ function() {{
 
             def on_cmd(raw_cmd: str, raw_proj: str):
                 p = loads_project(raw_proj)
+                screenshot_path = gr.update()
 
                 if not raw_cmd:
-                    return raw_proj, compute_preview_uri(self, p), ""
+                    return raw_proj, compute_preview_uri(self, p), "", screenshot_path
 
                 try:
                     cmd = json.loads(raw_cmd)
                 except Exception:
-                    return raw_proj, compute_preview_uri(self, p), ""
+                    return raw_proj, compute_preview_uri(self, p), "", screenshot_path
 
                 t = cmd.get("type")
 
                 if t == "SET_PLAYHEAD":
                     p.playhead_f = max(0, int(cmd.get("frame", 0)))
+                
+                elif t == "SCREENSHOT":
+                    img = _get_preview_image(self, p)
+                    if img:
+                        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".png", prefix="screenshot_")
+                        os.close(tmp_fd)
+                        img.save(tmp_path, "PNG")
+                        screenshot_path = tmp_path
 
                 elif t == "SELECT_CLIP":
                     p.selected_clip_id = cmd.get("clip_id")
@@ -1115,7 +1268,7 @@ function() {{
 
                 raw2 = dumps_project(p)
                 prev = compute_preview_uri(self, p)
-                return raw2, prev, ""
+                return raw2, prev, "", screenshot_path
 
             uploader.upload(
                 on_upload,
@@ -1126,7 +1279,7 @@ function() {{
             cmd_json.input(
                 on_cmd,
                 inputs=[cmd_json, project_json],
-                outputs=[project_json, preview_uri, cmd_json],
+                outputs=[project_json, preview_uri, cmd_json, screenshot_file],
             )
 
         return root
