@@ -126,7 +126,6 @@ class TimelineEditorPlugin(WAN2GPPlugin):
 
     def __init__(self):
         super().__init__()
-        self.globals: Dict[str, Any] = getattr(self, "globals", {})
         self.components: Dict[str, Any] = {}
 
     def setup_ui(self):
@@ -384,7 +383,9 @@ class TimelineEditorPlugin(WAN2GPPlugin):
                 with gr.Column(elem_id="te-center"):
                     with gr.Column():
                         gr.Markdown("### Timeline")
-                        gr.HTML("<div id='te-timeline-host'></div>", elem_id="te-timeline-host")
+                        gr.HTML(
+                            "<div id='te-timeline-host'></div>", elem_id="te-timeline-host"
+                        )
                     with gr.Column():
                         gr.Markdown("### Program (frame preview)")
                         program_frame = gr.Image(
@@ -399,18 +400,21 @@ class TimelineEditorPlugin(WAN2GPPlugin):
 
             def _kind_from_path(path: str) -> str:
                 try:
-                    if self.globals.get("has_video_file_extension", lambda _: False)(path):
+                    fn = getattr(self, "has_video_file_extension", None)
+                    if callable(fn) and fn(path):
                         return "video"
-                    if self.globals.get("has_image_file_extension", lambda _: False)(path):
+                    fn = getattr(self, "has_image_file_extension", None)
+                    if callable(fn) and fn(path):
                         return "image"
-                    if self.globals.get("has_audio_file_extension", lambda _: False)(path):
+                    fn = getattr(self, "has_audio_file_extension", None)
+                    if callable(fn) and fn(path):
                         return "audio"
                 except Exception:
                     pass
                 return "unknown"
 
             def _get_uid() -> str:
-                uid_fn = self.globals.get("get_unique_id")
+                uid_fn = getattr(self, "get_unique_id", None)
                 if callable(uid_fn):
                     return str(uid_fn())
                 return "id_" + str(abs(hash(object())))
@@ -428,20 +432,17 @@ class TimelineEditorPlugin(WAN2GPPlugin):
                 item = MediaItem(id=media_id, path=path, kind=kind)
 
                 if kind == "video":
-                    info_fn = self.globals.get("get_video_info")
+                    info_fn = getattr(self, "get_video_info", None)
                     if callable(info_fn):
                         try:
-                            info = info_fn(path) or {}
-                            if isinstance(info, dict):
-                                item.fps = float(info.get("fps")) if info.get("fps") else None
-                                item.frames = (
-                                    int(info.get("frames")) if info.get("frames") else None
-                                )
-                                item.duration_s = (
-                                    float(info.get("duration"))
-                                    if info.get("duration")
-                                    else None
-                                )
+                            info = info_fn(path)
+                            # Wan2GP get_video_info -> (fps, width, height, frame_count)
+                            if isinstance(info, (list, tuple)) and len(info) >= 4:
+                                fps, _w, _h, frame_count = info[:4]
+                                item.fps = float(fps) if fps else None
+                                item.frames = int(frame_count) if frame_count else None
+                                if item.fps and item.frames is not None:
+                                    item.duration_s = float(item.frames) / float(item.fps)
                         except Exception:
                             pass
 
@@ -475,7 +476,7 @@ class TimelineEditorPlugin(WAN2GPPlugin):
                 if selected:
                     media = find_media(project, selected.media_id)
                     if media and media.kind == "video":
-                        get_frame = self.globals.get("get_video_frame")
+                        get_frame = getattr(self, "get_video_frame", None)
                         if callable(get_frame):
                             try:
                                 playhead = project.playhead_f
@@ -491,7 +492,15 @@ class TimelineEditorPlugin(WAN2GPPlugin):
                                     media0 = find_media(project, clip0.media_id)
                                     if media0 and media0.kind == "video":
                                         media_frame = clip0.in_f + (playhead - clip0.start_f)
-                                        frame_img = get_frame(media0.path, int(media_frame))
+                                        # Wan2GP get_video_frame(..., return_PIL=True) returns PIL.Image
+                                        frame_img = get_frame(
+                                            media0.path,
+                                            int(media_frame),
+                                            return_PIL=True,
+                                        )
+                            except TypeError:
+                                # Fallback if signature differs
+                                frame_img = get_frame(media0.path, int(media_frame))
                             except Exception:
                                 frame_img = None
 
