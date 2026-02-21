@@ -39,6 +39,17 @@ def probe_audio_duration_seconds(path: str) -> Optional[float]:
     except Exception:
         return None
 
+def probe_video_has_audio(path: str) -> bool:
+    ffprobe = _which_ffprobe()
+    cmd = [
+        ffprobe, "-v", "error", "-select_streams", "a:0", 
+        "-show_entries", "stream=codec_type", "-of", "default=nw=1:nk=1", path
+    ]
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        return "audio" in p.stdout.lower()
+    except Exception:
+        return False
 
 def pil_to_data_uri(img: Image.Image, fmt: str = "PNG") -> str:
     buf = io.BytesIO()
@@ -61,6 +72,7 @@ class MediaItem:
     fps: Optional[float] = None
     frames: Optional[int] = None
     duration_s: Optional[float] = None
+    has_audio: Optional[bool] = None
 
 
 @dataclass
@@ -72,6 +84,7 @@ class Clip:
     in_f: int
     out_f: int  # exclusive
     kind: str    # "video" | "image" | "audio"
+    link_id: Optional[str] = None
 
 
 @dataclass
@@ -576,6 +589,7 @@ function() {{
 
     // Playback state
     let playing = false;
+    let uiPlayheadF = 0;
     let rafId = null;
     let lastTs = performance.now();
     let accumMs = 0;
@@ -609,33 +623,31 @@ function() {{
 
       while (accumMs >= frameMs) {{
         accumMs -= frameMs;
-        if (p.playhead_f < maxEnd) {{
-          p.playhead_f++;
+        if (uiPlayheadF < maxEnd) {{
+          uiPlayheadF++;
           updated = true;
         }} else {{
           playing = false;
           if (btnPlay) btnPlay.classList.replace("ph-pause", "ph-play");
+          sendCmd(cmdEl, {{ type: "SET_PLAYHEAD", frame: uiPlayheadF }});
           break;
         }}
       }}
 
       if (updated) {{
-        const newRaw = JSON.stringify(p);
-        projEl.value = newRaw;
-        lastProjRaw = newRaw; // Prevent interval from doing a full DOM rebuild of the timeline
-
-        const tc = frameToTimecode(p.playhead_f, fps);
+        const tc = frameToTimecode(uiPlayheadF, fps);
         if (mainTimecode) mainTimecode.innerText = tc;
         if (rulerTimecode) rulerTimecode.innerText = tc;
 
         const ppf = p.px_per_frame || 2.0;
-        const playX = Math.max(0, Math.round(p.playhead_f * ppf));
+        const playX = Math.max(0, Math.round(uiPlayheadF * ppf));
         if (playheadHead) playheadHead.style.left = `${{playX}}px`;
         if (playheadLine) playheadLine.style.left = `${{playX + 160}}px`;
 
         if (ts - lastBackendSyncTs > 120) {{
           lastBackendSyncTs = ts;
-          sendCmd(cmdEl, {{ type: "SET_PLAYHEAD", frame: p.playhead_f }});
+          // Send PREVIEW_AT instead of SET_PLAYHEAD to avoid state overwrite
+          sendCmd(cmdEl, {{ type: "PREVIEW_AT", frame: uiPlayheadF }});
         }}
       }}
     }}
@@ -646,11 +658,9 @@ function() {{
         if (btnPlay) btnPlay.classList.replace("ph-play", "ph-pause");
         const p = safeParse(projEl.value);
         const maxEnd = p ? getMaxEndFrame(p) : 0;
-        if (p && p.playhead_f >= maxEnd) {{
-          p.playhead_f = 0;
-          const newRaw = JSON.stringify(p);
-          projEl.value = newRaw;
-          lastProjRaw = newRaw;
+        uiPlayheadF = p ? (p.playhead_f || 0) : 0;
+        if (uiPlayheadF >= maxEnd && maxEnd > 0) {{
+          uiPlayheadF = 0;
         }}
         lastTs = performance.now();
         accumMs = 0;
@@ -658,8 +668,7 @@ function() {{
       }} else {{
         if (btnPlay) btnPlay.classList.replace("ph-pause", "ph-play");
         if (rafId) cancelAnimationFrame(rafId);
-        const p = safeParse(projEl.value);
-        if (p) sendCmd(cmdEl, {{ type: "SET_PLAYHEAD", frame: p.playhead_f }});
+        sendCmd(cmdEl, {{ type: "SET_PLAYHEAD", frame: uiPlayheadF }});
       }}
     }}
 
@@ -694,6 +703,16 @@ function() {{
         }}
       }});
     }}
+
+    document.addEventListener("keydown", (e) => {{
+        if (e.target.tagName === "INPUT" || e.target.tagName === "TEXTAREA") return;
+        if (e.key === "Backspace" || e.key === "Delete") {{
+            const p = safeParse(projEl.value);
+            if (p && p.selected_clip_id) {{
+                sendCmd(cmdEl, {{ type: "DELETE_CLIP", clip_id: p.selected_clip_id }});
+            }}
+        }}
+    }});
 
     function setCursor() {{
       if (!body) return;
@@ -768,8 +787,10 @@ function() {{
 
       const fps = p.fps || 25.0;
       const ppf = p.px_per_frame || 2.0;
+      
+      const currentFrame = playing ? uiPlayheadF : (p.playhead_f || 0);
 
-      const tc = frameToTimecode(p.playhead_f || 0, fps);
+      const tc = frameToTimecode(currentFrame, fps);
       if (mainTimecode) mainTimecode.innerText = tc;
       if (rulerTimecode) rulerTimecode.innerText = tc;
 
@@ -778,7 +799,7 @@ function() {{
         seqDurEl.innerText = frameToTimecode(getMaxEndFrame(p), fps);
       }}
 
-      const playX = Math.max(0, Math.round((p.playhead_f || 0) * ppf));
+      const playX = Math.max(0, Math.round(currentFrame * ppf));
       if (playheadHead) playheadHead.style.left = `${{playX}}px`;
       if (playheadLine) playheadLine.style.left = `${{playX + 160}}px`;
 
@@ -1099,7 +1120,7 @@ function() {{
                 cmd_json = gr.Textbox(value="", elem_id="te-cmd-json")
                 preview_uri = gr.Textbox(value="", elem_id="te-preview-uri")
                 uploader = gr.File(label="Uploader", file_count="multiple", type="filepath", elem_id="nle-upload")
-                screenshot_file = gr.File(label="Screenshot", visible=False, elem_id="te-screenshot-file")
+                screenshot_file = gr.File(label="Screenshot", elem_id="te-screenshot-file")
 
             root.load(fn=None, js=js)
 
@@ -1144,6 +1165,8 @@ function() {{
                                     item.frames = int(frame_count) if frame_count else None
                                     if item.fps and item.frames is not None:
                                         item.duration_s = float(item.frames) / float(item.fps)
+                            # Detect audio stream via ffprobe
+                            item.has_audio = probe_video_has_audio(path)
 
                         elif kind == "image":
                             img = Image.open(path)
@@ -1181,6 +1204,15 @@ function() {{
                 if t == "SET_PLAYHEAD":
                     p.playhead_f = max(0, int(cmd.get("frame", 0)))
                 
+                elif t == "PREVIEW_AT":
+                    frame = max(0, int(cmd.get("frame", 0)))
+                    original_f = p.playhead_f
+                    p.playhead_f = frame
+                    prev = compute_preview_uri(self, p)
+                    p.playhead_f = original_f
+                    # Return original raw_proj unmodified so client state is not forced to rewind!
+                    return raw_proj, prev, "", screenshot_path
+
                 elif t == "SCREENSHOT":
                     img = _get_preview_image(self, p)
                     if img:
@@ -1192,6 +1224,17 @@ function() {{
                 elif t == "SELECT_CLIP":
                     p.selected_clip_id = cmd.get("clip_id")
 
+                elif t == "DELETE_CLIP":
+                    cid = cmd.get("clip_id")
+                    target = find_clip(p, cid)
+                    if target:
+                        if target.link_id:
+                            p.clips = [c for c in p.clips if c.link_id != target.link_id]
+                        else:
+                            p.clips = [c for c in p.clips if c.id != target.id]
+                        if p.selected_clip_id == cid:
+                            p.selected_clip_id = None
+
                 elif t == "ADD_CLIP":
                     media_id = cmd.get("media_id")
                     track_id = cmd.get("track_id", "V1")
@@ -1199,10 +1242,11 @@ function() {{
 
                     m = find_media(p, media_id)
                     if m:
-                        if track_id.startswith("A") and m.kind != "audio":
-                            pass
+                        # Validation logic
+                        if track_id.startswith("A") and m.kind != "audio" and not (m.kind == "video" and m.has_audio):
+                            pass  # Disallow images or video-without-audio on Audio tracks
                         elif track_id.startswith("V") and m.kind == "audio":
-                            pass
+                            pass  # Disallow Audio strictly on Video tracks
                         else:
                             if m.frames is not None:
                                 dur_f = max(1, int(m.frames))
@@ -1212,16 +1256,34 @@ function() {{
                                 dur_f = int(round(p.fps * 2.0))
 
                             clip_id = f"c_{abs(hash(os.urandom(8)))}"
-                            c = Clip(
-                                id=clip_id,
-                                media_id=m.id,
-                                track_id=track_id,
-                                start_f=start_f,
-                                in_f=0,
-                                out_f=dur_f,
-                                kind=m.kind,
-                            )
-                            p.clips.append(c)
+                            clips_to_add = []
+
+                            if m.kind == "video" and track_id.startswith("V") and m.has_audio:
+                                link_id = f"l_{abs(hash(os.urandom(8)))}"
+                                cv = Clip(
+                                    id=clip_id, media_id=m.id, track_id=track_id, start_f=start_f,
+                                    in_f=0, out_f=dur_f, kind="video", link_id=link_id
+                                )
+                                ca_id = f"c_{abs(hash(os.urandom(8)))}"
+                                ca = Clip(
+                                    id=ca_id, media_id=m.id, track_id="A1", start_f=start_f,
+                                    in_f=0, out_f=dur_f, kind="audio", link_id=link_id
+                                )
+                                clips_to_add.extend([cv, ca])
+                            elif m.kind == "video" and track_id.startswith("A") and m.has_audio:
+                                c = Clip(
+                                    id=clip_id, media_id=m.id, track_id=track_id, start_f=start_f,
+                                    in_f=0, out_f=dur_f, kind="audio", link_id=None
+                                )
+                                clips_to_add.append(c)
+                            else:
+                                c = Clip(
+                                    id=clip_id, media_id=m.id, track_id=track_id, start_f=start_f,
+                                    in_f=0, out_f=dur_f, kind=m.kind, link_id=None
+                                )
+                                clips_to_add.append(c)
+
+                            p.clips.extend(clips_to_add)
                             p.selected_clip_id = clip_id
 
                 elif t == "MOVE_CLIP":
@@ -1229,15 +1291,30 @@ function() {{
                     new_start = max(0, int(cmd.get("start_f", 0)))
                     new_track = cmd.get("track_id")
 
-                    for c in p.clips:
-                        if c.id == cid:
-                            c.start_f = new_start
-                            if isinstance(new_track, str) and new_track:
-                                if new_track.startswith("V") and c.kind in ("video", "image"):
-                                    c.track_id = new_track
-                                elif new_track.startswith("A") and c.kind == "audio":
-                                    c.track_id = new_track
-                            break
+                    target = find_clip(p, cid)
+                    if target:
+                        delta = new_start - target.start_f
+                        if target.link_id:
+                            linked_clips = [c for c in p.clips if c.link_id == target.link_id]
+                            # Cap delta if moving left out of bounds
+                            min_start = min(c.start_f for c in linked_clips)
+                            if min_start + delta < 0:
+                                delta = -min_start
+                                
+                            for c in linked_clips:
+                                c.start_f += delta
+                                if c.id == cid and new_track:
+                                    if new_track.startswith("V") and c.kind in ("video", "image"):
+                                        c.track_id = new_track
+                                    elif new_track.startswith("A") and c.kind == "audio":
+                                        c.track_id = new_track
+                        else:
+                            target.start_f += delta
+                            if new_track:
+                                if new_track.startswith("V") and target.kind in ("video", "image"):
+                                    target.track_id = new_track
+                                elif new_track.startswith("A") and target.kind == "audio":
+                                    target.track_id = new_track
 
                 elif t == "RAZOR_CUT":
                     cid = cmd.get("clip_id")
@@ -1248,23 +1325,25 @@ function() {{
                         dur = clip_duration_frames(target)
                         cut_off = max(1, min(dur - 1, cut_off))
 
-                        first = target
-                        second_id = f"{first.id}_b"
-                        second = Clip(
-                            id=second_id,
-                            media_id=first.media_id,
-                            track_id=first.track_id,
-                            start_f=first.start_f + cut_off,
-                            in_f=first.in_f + cut_off,
-                            out_f=first.out_f,
-                            kind=first.kind,
-                        )
-                        first.out_f = first.in_f + cut_off
+                        link_group = [c for c in p.clips if c.link_id == target.link_id] if target.link_id else [target]
+                        new_link_id = f"l_{abs(hash(os.urandom(8)))}" if target.link_id else None
 
-                        p.clips = [c for c in p.clips if c.id != first.id]
-                        p.clips.append(first)
-                        p.clips.append(second)
-                        p.selected_clip_id = first.id
+                        for c in link_group:
+                            second_id = f"{c.id}_b"
+                            second = Clip(
+                                id=second_id,
+                                media_id=c.media_id,
+                                track_id=c.track_id,
+                                start_f=c.start_f + cut_off,
+                                in_f=c.in_f + cut_off,
+                                out_f=c.out_f,
+                                kind=c.kind,
+                                link_id=new_link_id
+                            )
+                            c.out_f = c.in_f + cut_off
+                            p.clips.append(second)
+                            
+                        p.selected_clip_id = target.id
 
                 raw2 = dumps_project(p)
                 prev = compute_preview_uri(self, p)
