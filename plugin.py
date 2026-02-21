@@ -440,7 +440,7 @@ class TimelineEditorPlugin(WAN2GPPlugin):
   .drag-over { background-color: #2a2a2a !important; border: 2px dashed #2d8ceb !important; }
 
   /* Clips & tools */
-  .clip { transition: filter 0.1s; position: absolute; height: calc(100% - 2px); top: 1px; display: flex; align-items: center; padding: 0 4px; overflow: hidden; border-radius: 2px; }
+  .clip { transition: filter 0.1s; position: absolute; height: calc(100% - 2px); top: 1px; display: flex; align-items: center; padding: 0 4px; overflow: hidden; border-radius: 2px; touch-action: none; }
   .clip:hover { filter: brightness(1.2); }
   .clip.audio { background-color: #1f6a43; border: 1px solid #339e66; }
   .clip.video { background-color: #5d30a6; border: 1px solid #a178e6; }
@@ -880,23 +880,30 @@ function() {{
         clipEl.dataset.clipId = c.id;
 
         clipEl.innerHTML = `
-          <span class="text-white text-[10px] truncate whitespace-nowrap drop-shadow-md pointer-events-none select-none px-1">
+          <div class="absolute left-0 top-0 bottom-0 w-2 cursor-col-resize hover:bg-white/30 z-20" data-handle="IN"></div>
+          <span class="text-white text-[10px] truncate whitespace-nowrap drop-shadow-md pointer-events-none select-none px-2">
             ${{(findMediaName(p, c.media_id) || c.id)}}
           </span>
+          <div class="absolute right-0 top-0 bottom-0 w-2 cursor-col-resize hover:bg-white/30 z-20" data-handle="OUT"></div>
         `;
 
-        clipEl.addEventListener("mousedown", (e) => {{
+        clipEl.addEventListener("pointerdown", (e) => {{
           if (playing) togglePlay();
           e.stopPropagation();
           sendCmd(cmdEl, {{ type: "SELECT_CLIP", clip_id: c.id }});
 
+          const handle = e.target.dataset.handle;
+
           if (ui.activeTool === "selection") {{
             ui.dragging = {{
               clipId: c.id,
+              type: handle ? `trim_${{handle.toLowerCase()}}` : 'move',
               startX: e.clientX,
               startLeftPx: leftPx,
+              startWidthPx: widthPx,
             }};
             clipEl.style.zIndex = "50";
+            clipEl.setPointerCapture(e.pointerId);
           }} else if (ui.activeTool === "razor") {{
             const rect = clipEl.getBoundingClientRect();
             const cutPx = e.clientX - rect.left;
@@ -907,17 +914,69 @@ function() {{
           }}
         }});
 
-        clipEl.addEventListener("mousemove", (e) => {{
-          if (ui.activeTool !== "razor") return;
-          if (!razorGuide || !tracksContent) return;
-          const tracksRect = tracksContent.getBoundingClientRect();
-          const relX = e.clientX - tracksRect.left;
-          razorGuide.style.display = "block";
-          razorGuide.style.left = `${{relX}}px`;
+        clipEl.addEventListener("pointermove", (e) => {{
+          if (!ui.dragging || ui.dragging.clipId !== c.id) return;
+          e.stopPropagation();
+
+          const dx = e.clientX - ui.dragging.startX;
+
+          if (ui.dragging.type === 'move') {{
+            const newLeft = Math.max(0, ui.dragging.startLeftPx + dx);
+            clipEl.style.left = `${{newLeft}}px`;
+          }} else if (ui.dragging.type === 'trim_in') {{
+            let newLeft = Math.max(0, ui.dragging.startLeftPx + dx);
+            let newWidth = ui.dragging.startWidthPx - (newLeft - ui.dragging.startLeftPx);
+            if (newWidth < 6) {{
+                newWidth = 6;
+                newLeft = ui.dragging.startLeftPx + ui.dragging.startWidthPx - 6;
+            }}
+            clipEl.style.left = `${{newLeft}}px`;
+            clipEl.style.width = `${{newWidth}}px`;
+          }} else if (ui.dragging.type === 'trim_out') {{
+            const newWidth = Math.max(6, ui.dragging.startWidthPx + dx);
+            clipEl.style.width = `${{newWidth}}px`;
+          }}
         }});
 
-        clipEl.addEventListener("mouseleave", () => {{
-          if (razorGuide) razorGuide.style.display = "none";
+        clipEl.addEventListener("pointerup", (e) => {{
+          if (!ui.dragging || ui.dragging.clipId !== c.id) return;
+          e.stopPropagation();
+          clipEl.releasePointerCapture(e.pointerId);
+
+          if (ui.dragging.type === 'move') {{
+            const dx = e.clientX - ui.dragging.startX;
+            const newLeft = Math.max(0, ui.dragging.startLeftPx + dx);
+            const newStartF = Math.max(0, Math.round(newLeft / ppf));
+            
+            let newTrack = null;
+            clipEl.style.visibility = 'hidden';
+            const elUnder = document.elementFromPoint(e.clientX, e.clientY);
+            clipEl.style.visibility = '';
+            
+            if (elUnder) {{
+              const trackEl = elUnder.closest(".track");
+              if (trackEl && trackEl.dataset.track) newTrack = trackEl.dataset.track;
+            }}
+            sendCmd(cmdEl, {{ type: "MOVE_CLIP", clip_id: c.id, start_f: newStartF, track_id: newTrack }});
+          }} else if (ui.dragging.type === 'trim_in') {{
+            const dx = e.clientX - ui.dragging.startX;
+            let newLeft = Math.max(0, ui.dragging.startLeftPx + dx);
+            let newWidth = ui.dragging.startWidthPx - (newLeft - ui.dragging.startLeftPx);
+            if (newWidth < 6) newLeft = ui.dragging.startLeftPx + ui.dragging.startWidthPx - 6;
+            
+            const newStartF = Math.max(0, Math.round(newLeft / ppf));
+            sendCmd(cmdEl, {{ type: "TRIM_CLIP", clip_id: c.id, edge: "IN", new_frame: newStartF }});
+          }} else if (ui.dragging.type === 'trim_out') {{
+            const dx = e.clientX - ui.dragging.startX;
+            const newWidth = Math.max(6, ui.dragging.startWidthPx + dx);
+            const newEndPx = ui.dragging.startLeftPx + newWidth;
+            const newEndF = Math.round(newEndPx / ppf);
+            
+            sendCmd(cmdEl, {{ type: "TRIM_CLIP", clip_id: c.id, edge: "OUT", new_frame: newEndF }});
+          }}
+
+          clipEl.style.zIndex = "10";
+          ui.dragging = null;
         }});
 
         track.appendChild(clipEl);
@@ -951,6 +1010,22 @@ function() {{
           sendCmd(cmdEl, {{ type: "ADD_CLIP", media_id: mediaId, track_id: trackId, start_f: startF }});
         }};
       }});
+      
+      // Razor guide over tracks container
+      const tracksContent = $("#tracks-content");
+      if (tracksContent) {{
+        tracksContent.addEventListener("mousemove", (e) => {{
+            if (ui.activeTool !== "razor" || ui.dragging) return;
+            if (!razorGuide) return;
+            const tracksRect = tracksContent.getBoundingClientRect();
+            const relX = e.clientX - tracksRect.left;
+            razorGuide.style.display = "block";
+            razorGuide.style.left = `${{relX}}px`;
+        }});
+        tracksContent.addEventListener("mouseleave", () => {{
+            if (razorGuide) razorGuide.style.display = "none";
+        }});
+      }}
     }}
 
     function findMediaName(p, mediaId) {{
@@ -995,10 +1070,13 @@ function() {{
     }}
 
     if (ruler) {{
-      ruler.addEventListener("mousedown", (e) => {{
+      ruler.addEventListener("pointerdown", (e) => {{
         if (playing) togglePlay();
         const p = safeParse(projEl.value);
         if (!p) return;
+        
+        ruler.setPointerCapture(e.pointerId);
+        
         const rect = ruler.getBoundingClientRect();
         const ppf = p.px_per_frame || 2.0;
 
@@ -1012,61 +1090,18 @@ function() {{
         setFromX(e.clientX - rect.left);
 
         const move = (ev) => setFromX(ev.clientX - rect.left);
-        const up = () => {{
-          document.removeEventListener("mousemove", move);
-          document.removeEventListener("mouseup", up);
+        const up = (ev) => {{
+          ruler.removeEventListener("pointermove", move);
+          ruler.removeEventListener("pointerup", up);
+          ruler.removeEventListener("pointercancel", up);
+          ruler.releasePointerCapture(ev.pointerId);
           sendCmd(cmdEl, {{ type: "SET_PLAYHEAD", frame: uiPlayheadF }});
         }};
-        document.addEventListener("mousemove", move);
-        document.addEventListener("mouseup", up);
+        ruler.addEventListener("pointermove", move);
+        ruler.addEventListener("pointerup", up);
+        ruler.addEventListener("pointercancel", up);
       }});
     }}
-
-    document.addEventListener("mousemove", (e) => {{
-      if (!ui.dragging) return;
-      const p = safeParse(projEl.value);
-      if (!p) return;
-
-      const dx = e.clientX - ui.dragging.startX;
-      const newLeft = Math.max(0, ui.dragging.startLeftPx + dx);
-
-      const el = document.querySelector(`.clip[data-clip-id="${{ui.dragging.clipId}}"]`);
-      if (el) el.style.left = `${{newLeft}}px`;
-    }});
-
-    document.addEventListener("mouseup", (e) => {{
-      if (!ui.dragging) return;
-
-      const p = safeParse(projEl.value);
-      if (!p) {{
-        ui.dragging = null;
-        return;
-      }}
-
-      const dx = e.clientX - ui.dragging.startX;
-      const newLeft = Math.max(0, ui.dragging.startLeftPx + dx);
-      const ppf = p.px_per_frame || 2.0;
-      const newStartF = Math.max(0, Math.round(newLeft / ppf));
-
-      let newTrack = null;
-      const elUnder = document.elementFromPoint(e.clientX, e.clientY);
-      if (elUnder) {{
-        const trackEl = elUnder.closest(".track");
-        if (trackEl && trackEl.dataset.track) newTrack = trackEl.dataset.track;
-      }}
-
-      sendCmd(cmdEl, {{
-        type: "MOVE_CLIP",
-        clip_id: ui.dragging.clipId,
-        start_f: newStartF,
-        track_id: newTrack
-      }});
-
-      const el = document.querySelector(`.clip[data-clip-id="${{ui.dragging.clipId}}"]`);
-      if (el) el.style.zIndex = "10";
-
-      ui.dragging = null;
-    }});
 
     // Import behavior
     if (btnImport && hiddenFileInput) {{
@@ -1356,6 +1391,41 @@ function() {{
 
                             p.clips.extend(clips_to_add)
                             p.selected_clip_id = clip_id
+
+                elif t == "TRIM_CLIP":
+                    cid = cmd.get("clip_id")
+                    edge = cmd.get("edge") # "IN" or "OUT"
+                    new_frame = max(0, int(cmd.get("new_frame", 0)))
+                    
+                    target = find_clip(p, cid)
+                    if target:
+                        link_group = [c for c in p.clips if c.link_id == target.link_id] if target.link_id else [target]
+                        
+                        if edge == "IN":
+                            delta_start = new_frame - target.start_f
+                            for c in link_group:
+                                # Keep at least 1 frame duration
+                                max_delta = (c.out_f - c.in_f) - 1
+                                actual_delta = min(delta_start, max_delta)
+                                # Cannot trim before start of media file
+                                if c.in_f + actual_delta < 0:
+                                    actual_delta = -c.in_f
+                                # Cannot place before timeline 0
+                                if c.start_f + actual_delta < 0:
+                                    actual_delta = -c.start_f
+                                    
+                                c.start_f += actual_delta
+                                c.in_f += actual_delta
+                                
+                        elif edge == "OUT":
+                            new_dur = new_frame - target.start_f
+                            for c in link_group:
+                                actual_dur = max(1, new_dur)
+                                m = find_media(p, c.media_id)
+                                if m and m.frames is not None:
+                                    max_dur = m.frames - c.in_f
+                                    actual_dur = min(actual_dur, max_dur)
+                                c.out_f = c.in_f + actual_dur
 
                 elif t == "MOVE_CLIP":
                     cid = cmd.get("clip_id")
